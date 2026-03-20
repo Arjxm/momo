@@ -1,0 +1,11 @@
+/target
+.env
+.DS_Store
+
+# Database files
+agent_brain
+agent_brain.wal
+*.db
+
+# User workspace
+workspace/

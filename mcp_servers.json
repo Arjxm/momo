@@ -1,0 +1,48 @@
+{
+  "servers": [
+    {
+      "name": "playwright",
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"],
+      "transport": "stdio",
+      "env": {},
+      "auto_connect": true
+    },
+    {
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/arjun/Personal/agent-brain/workspace"],
+      "transport": "stdio",
+      "env": {},
+      "auto_connect": true
+    },
+    {
+      "name": "github",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "transport": "stdio",
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      },
+      "auto_connect": false
+    },
+    {
+      "name": "sqlite",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sqlite", "--db-path", "/tmp/agent.db"],
+      "transport": "stdio",
+      "env": {},
+      "auto_connect": false
+    },
+    {
+      "name": "brave-search",
+      "command": "npx",
+      "args": ["-y", "@anthropics/mcp-server-brave-search"],
+      "transport": "stdio",
+      "env": {
+        "BRAVE_API_KEY": "${BRAVE_API_KEY}"
+      },
+      "auto_connect": false
+    }
+  ]
+}
