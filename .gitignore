@@ -1,6 +1,7 @@
 /target
 .env
 .DS_Store
+provider_config.json
 
 # Database files
 agent_brain
