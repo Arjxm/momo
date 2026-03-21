@@ -2,14 +2,29 @@
 //!
 //! Users can add custom skills by dropping files into the skills/ directory.
 //! Each skill is a directory containing:
-//! - SKILL.toml - Manifest file with metadata
+//! - SKILL.toml - Manifest file with metadata (for Executable skills)
 //! - main.py / main.js / main.wasm - Implementation file
+//! OR:
+//! - skill.md - Markdown documentation with YAML frontmatter (for Knowledge skills)
 //!
-//! Skills communicate via stdin/stdout JSON.
+//! Executable skills communicate via stdin/stdout JSON.
+//! Knowledge skills are injected into the system prompt when relevant.
 
 pub mod loader;
+pub mod matcher;
 pub mod registry;
 pub mod sandbox;
+
+use serde::{Deserialize, Serialize};
+
+/// Type of skill - executable code or knowledge documentation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SkillType {
+    /// Executable skill (Python, JavaScript, WASM)
+    Executable,
+    /// Knowledge skill (Markdown documentation injected into context)
+    Knowledge,
+}
 
 use std::sync::Arc;
 
@@ -19,6 +34,7 @@ use crate::graph::GraphBrain;
 use crate::types::{AgentError, ToolNode};
 
 pub use loader::{SkillLoader, SkillManifest};
+pub use matcher::SkillMatcher;
 pub use registry::SkillRegistry;
 pub use sandbox::SkillSandbox;
 
@@ -74,5 +90,30 @@ impl SkillManager {
     /// Get a mutable reference to the registry
     pub fn registry_mut(&mut self) -> &mut SkillRegistry {
         &mut self.registry
+    }
+
+    /// Match user query against knowledge skills and return formatted documentation
+    pub fn match_knowledge_skills(&self, query: &str) -> String {
+        let knowledge_skills = self.registry.knowledge_skills();
+        if knowledge_skills.is_empty() {
+            return String::new();
+        }
+
+        let matched = SkillMatcher::match_skills(query, &knowledge_skills);
+        if matched.is_empty() {
+            return String::new();
+        }
+
+        info!("Matched {} knowledge skill(s) for query", matched.len());
+        for skill in &matched {
+            info!("  - {}: {}", skill.name,
+                if skill.description.len() > 50 {
+                    format!("{}...", &skill.description[..50])
+                } else {
+                    skill.description.clone()
+                });
+        }
+
+        SkillMatcher::format_for_prompt(&matched)
     }
 }

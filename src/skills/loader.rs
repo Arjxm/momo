@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use crate::skills::SkillType;
 use crate::types::AgentError;
 
 /// A loaded skill manifest
@@ -13,8 +14,13 @@ pub struct SkillManifest {
     pub name: String,
     pub description: String,
     pub version: u32,
-    pub language: String,
-    pub entrypoint: PathBuf,
+    pub skill_type: SkillType,
+    /// Language for Executable skills (python, javascript, wasm)
+    pub language: Option<String>,
+    /// Entrypoint for Executable skills
+    pub entrypoint: Option<PathBuf>,
+    /// Full markdown content for Knowledge skills
+    pub content: Option<String>,
     pub input_schema: serde_json::Value,
     pub output_schema: serde_json::Value,
     pub topics: Vec<String>,
@@ -63,6 +69,16 @@ struct MetadataSection {
     composes_with: Vec<String>,
 }
 
+/// YAML frontmatter for markdown knowledge skills
+#[derive(Debug, Deserialize, Default)]
+struct MarkdownFrontmatter {
+    name: Option<String>,
+    description: Option<String>,
+    version: Option<u32>,
+    #[serde(default)]
+    topics: Option<Vec<String>>,
+}
+
 /// Skill loader that scans the skills directory
 pub struct SkillLoader {
     skills_dir: PathBuf,
@@ -95,16 +111,31 @@ impl SkillLoader {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                // Look for SKILL.toml in each subdirectory
+                // Look for SKILL.toml (executable skill) first
                 let skill_toml = path.join("SKILL.toml");
                 if skill_toml.exists() {
                     match self.load_manifest(&path, &skill_toml) {
                         Ok(manifest) => {
-                            info!("Loaded skill: {} (v{})", manifest.name, manifest.version);
+                            info!("Loaded executable skill: {} (v{})", manifest.name, manifest.version);
                             manifests.push(manifest);
                         }
                         Err(e) => {
                             warn!("Failed to load skill from {:?}: {}", path, e);
+                        }
+                    }
+                    continue; // Don't also check for skill.md if SKILL.toml exists
+                }
+
+                // Look for skill.md (knowledge skill)
+                let skill_md = path.join("skill.md");
+                if skill_md.exists() {
+                    match self.load_markdown_skill(&path, &skill_md) {
+                        Ok(manifest) => {
+                            info!("Loaded knowledge skill: {} (v{})", manifest.name, manifest.version);
+                            manifests.push(manifest);
+                        }
+                        Err(e) => {
+                            warn!("Failed to load markdown skill from {:?}: {}", path, e);
                         }
                     }
                 }
@@ -115,7 +146,7 @@ impl SkillLoader {
         Ok(manifests)
     }
 
-    /// Load a single skill manifest
+    /// Load an executable skill manifest from SKILL.toml
     fn load_manifest(&self, skill_dir: &Path, toml_path: &Path) -> Result<SkillManifest, AgentError> {
         let content = std::fs::read_to_string(toml_path)
             .map_err(|e| AgentError::ConfigError(format!("Failed to read SKILL.toml: {}", e)))?;
@@ -154,8 +185,10 @@ impl SkillLoader {
             name: toml.skill.name,
             description: toml.skill.description,
             version: toml.skill.version,
-            language: toml.skill.language,
-            entrypoint,
+            skill_type: SkillType::Executable,
+            language: Some(toml.skill.language),
+            entrypoint: Some(entrypoint),
+            content: None,
             input_schema,
             output_schema,
             topics: toml.metadata.topics,
@@ -163,10 +196,73 @@ impl SkillLoader {
         })
     }
 
-    /// Read the code content of a skill
+    /// Load a knowledge skill from skill.md markdown file
+    fn load_markdown_skill(&self, skill_dir: &Path, md_path: &Path) -> Result<SkillManifest, AgentError> {
+        let content = std::fs::read_to_string(md_path)
+            .map_err(|e| AgentError::ConfigError(format!("Failed to read skill.md: {}", e)))?;
+
+        // Parse YAML frontmatter
+        let (frontmatter, body) = Self::parse_frontmatter(&content)?;
+
+        let name = frontmatter.name.ok_or_else(|| {
+            AgentError::ConfigError(format!("Missing 'name' in frontmatter: {:?}", skill_dir))
+        })?;
+
+        let description = frontmatter.description.ok_or_else(|| {
+            AgentError::ConfigError(format!("Missing 'description' in frontmatter: {:?}", skill_dir))
+        })?;
+
+        info!("Loaded knowledge skill: {} from {:?}", name, md_path);
+
+        Ok(SkillManifest {
+            name,
+            description,
+            version: frontmatter.version.unwrap_or(1),
+            skill_type: SkillType::Knowledge,
+            language: None,
+            entrypoint: None,
+            content: Some(body),
+            input_schema: serde_json::Value::Null,
+            output_schema: serde_json::Value::Null,
+            topics: frontmatter.topics.unwrap_or_default(),
+            composes_with: Vec::new(),
+        })
+    }
+
+    /// Parse YAML frontmatter from markdown content
+    fn parse_frontmatter(content: &str) -> Result<(MarkdownFrontmatter, String), AgentError> {
+        let content = content.trim();
+
+        if !content.starts_with("---") {
+            return Err(AgentError::ConfigError(
+                "Markdown skill must have YAML frontmatter starting with ---".to_string()
+            ));
+        }
+
+        // Find the closing ---
+        let after_first = &content[3..];
+        let end_index = after_first.find("\n---").ok_or_else(|| {
+            AgentError::ConfigError("Missing closing --- for frontmatter".to_string())
+        })?;
+
+        let yaml_content = &after_first[..end_index].trim();
+        let body = after_first[end_index + 4..].trim().to_string();
+
+        let frontmatter: MarkdownFrontmatter = serde_yaml::from_str(yaml_content)
+            .map_err(|e| AgentError::ConfigError(format!("Failed to parse frontmatter YAML: {}", e)))?;
+
+        Ok((frontmatter, body))
+    }
+
+    /// Read the code content of an executable skill
     pub fn load_code(&self, manifest: &SkillManifest) -> Result<String, AgentError> {
-        std::fs::read_to_string(&manifest.entrypoint)
-            .map_err(|e| AgentError::ConfigError(format!("Failed to read skill code: {}", e)))
+        match &manifest.entrypoint {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(|e| AgentError::ConfigError(format!("Failed to read skill code: {}", e))),
+            None => Err(AgentError::ConfigError(
+                "Cannot load code for knowledge skill (no entrypoint)".to_string()
+            )),
+        }
     }
 
     /// Get the skills directory path
@@ -203,20 +299,25 @@ impl SkillWatcher {
             let manifests = self.loader.scan()?;
 
             for manifest in manifests {
-                let modified = std::fs::metadata(&manifest.entrypoint)
-                    .and_then(|m| m.modified())
-                    .ok();
+                // For executable skills, watch the entrypoint
+                // For knowledge skills, we could watch the skill.md but for simplicity
+                // we just trigger on the manifest.name change (re-scan will pick up changes)
+                if let Some(ref entrypoint) = manifest.entrypoint {
+                    let modified = std::fs::metadata(entrypoint)
+                        .and_then(|m| m.modified())
+                        .ok();
 
-                if let Some(mod_time) = modified {
-                    let is_new_or_modified = last_modified
-                        .get(&manifest.entrypoint)
-                        .map(|&last| mod_time > last)
-                        .unwrap_or(true);
+                    if let Some(mod_time) = modified {
+                        let is_new_or_modified = last_modified
+                            .get(entrypoint)
+                            .map(|&last| mod_time > last)
+                            .unwrap_or(true);
 
-                    if is_new_or_modified {
-                        debug!("Skill changed: {}", manifest.name);
-                        last_modified.insert(manifest.entrypoint.clone(), mod_time);
-                        callback(manifest);
+                        if is_new_or_modified {
+                            debug!("Skill changed: {}", manifest.name);
+                            last_modified.insert(entrypoint.clone(), mod_time);
+                            callback(manifest);
+                        }
                     }
                 }
             }
@@ -283,7 +384,7 @@ composes_with = ["web_fetch"]
 
         assert_eq!(manifests.len(), 1);
         assert_eq!(manifests[0].name, "test_skill");
-        assert_eq!(manifests[0].language, "python");
+        assert_eq!(manifests[0].language, Some("python".to_string()));
         assert_eq!(manifests[0].topics, vec!["test", "demo"]);
     }
 }

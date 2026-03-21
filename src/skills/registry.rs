@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 use crate::graph::GraphBrain;
 use crate::skills::loader::{SkillLoader, SkillManifest};
 use crate::skills::sandbox::SkillSandbox;
+use crate::skills::SkillType;
 use crate::types::{AgentError, ToolNode, ToolType};
 
 /// Registry that manages user skills and their integration with the graph
@@ -37,31 +38,55 @@ impl SkillRegistry {
         let manifests = self.loader.scan()?;
 
         let mut registered_tools = Vec::new();
+        let mut knowledge_skills = 0;
+
         for manifest in manifests {
-            match self.register_skill(&manifest) {
-                Ok(tool) => {
-                    self.manifests.insert(manifest.name.clone(), manifest);
-                    registered_tools.push(tool);
+            // Cache all manifests (both executable and knowledge)
+            self.manifests.insert(manifest.name.clone(), manifest.clone());
+
+            // Only register executable skills as tools
+            if manifest.skill_type == SkillType::Executable {
+                match self.register_skill(&manifest) {
+                    Ok(tool) => {
+                        registered_tools.push(tool);
+                    }
+                    Err(e) => {
+                        warn!("Failed to register skill {}: {}", manifest.name, e);
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to register skill {}: {}", manifest.name, e);
-                }
+            } else {
+                knowledge_skills += 1;
+                info!("Loaded knowledge skill: {}", manifest.name);
             }
         }
 
-        info!("Registered {} skills", registered_tools.len());
+        info!("Registered {} executable skills, {} knowledge skills",
+            registered_tools.len(), knowledge_skills);
         Ok(registered_tools)
     }
 
-    /// Register a single skill in the graph
+    /// Register a single executable skill in the graph
     fn register_skill(&self, manifest: &SkillManifest) -> Result<ToolNode, AgentError> {
+        // Only executable skills should be registered as tools
+        if manifest.skill_type != SkillType::Executable {
+            return Err(AgentError::ConfigError(
+                "Only executable skills can be registered as tools".to_string()
+            ));
+        }
+
+        let entrypoint = manifest.entrypoint.as_ref()
+            .ok_or_else(|| AgentError::ConfigError("Missing entrypoint for executable skill".to_string()))?;
+
+        let language = manifest.language.as_ref()
+            .ok_or_else(|| AgentError::ConfigError("Missing language for executable skill".to_string()))?;
+
         // Create the tool node
         let tool_node = ToolNode::new(
             manifest.name.clone(),
             manifest.description.clone(),
             ToolType::Skill,
             manifest.input_schema.clone(),
-            manifest.entrypoint.to_string_lossy().to_string(),
+            entrypoint.to_string_lossy().to_string(),
         );
 
         // Register in graph
@@ -84,13 +109,13 @@ impl SkillRegistry {
 
         debug!(
             "Registered skill: {} (v{}, {})",
-            manifest.name, manifest.version, manifest.language
+            manifest.name, manifest.version, language
         );
 
         Ok(tool_node)
     }
 
-    /// Execute a skill by name
+    /// Execute a skill by name (only executable skills)
     pub async fn execute_skill(
         &self,
         skill_name: &str,
@@ -101,14 +126,27 @@ impl SkillRegistry {
             AgentError::ToolError(format!("Skill not found: {}", skill_name))
         })?;
 
-        debug!("Executing skill: {} ({})", skill_name, manifest.language);
+        // Only executable skills can be executed
+        if manifest.skill_type != SkillType::Executable {
+            return Err(AgentError::ToolError(
+                format!("Cannot execute knowledge skill '{}' - it's documentation only", skill_name)
+            ));
+        }
+
+        let language = manifest.language.as_ref()
+            .ok_or_else(|| AgentError::ToolError("Missing language for skill".to_string()))?;
+
+        let entrypoint = manifest.entrypoint.as_ref()
+            .ok_or_else(|| AgentError::ToolError("Missing entrypoint for skill".to_string()))?;
+
+        debug!("Executing skill: {} ({})", skill_name, language);
 
         // Execute in sandbox
         let result = self
             .sandbox
             .execute(
-                &manifest.language,
-                &manifest.entrypoint.to_string_lossy(),
+                language,
+                &entrypoint.to_string_lossy(),
                 input,
                 Some(10), // 10 second timeout
             )
@@ -150,6 +188,14 @@ impl SkillRegistry {
     /// Check if a skill exists
     pub fn has_skill(&self, name: &str) -> bool {
         self.manifests.contains_key(name)
+    }
+
+    /// Get all knowledge skills
+    pub fn knowledge_skills(&self) -> Vec<&SkillManifest> {
+        self.manifests
+            .values()
+            .filter(|m| m.skill_type == SkillType::Knowledge)
+            .collect()
     }
 
     /// Get the loader for external access
