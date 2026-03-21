@@ -42,15 +42,17 @@ impl BrowserTool {
             return Ok(());
         }
 
-        info!("Launching headless browser");
+        info!("Launching browser (visible mode)");
 
         let (browser, mut handler) = Browser::launch(
             BrowserConfig::builder()
+                .with_head() // Show browser window
                 .arg("--disable-gpu")
                 .arg("--no-sandbox")
                 .arg("--disable-dev-shm-usage")
                 .arg("--disable-extensions")
                 .arg("--disable-downloads")
+                .window_size(1280, 800)
                 .build()
                 .map_err(|e| AgentError::ToolError(format!("Failed to build browser config: {}", e)))?,
         )
