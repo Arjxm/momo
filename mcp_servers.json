@@ -1,23 +1,53 @@
 {
   "servers": [
     {
-      "name": "playwright",
+      "name": "memory",
+      "description": "Persistent entity-relationship memory. Create entities, relations, observations.",
       "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest"],
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "transport": "stdio",
+      "env": {},
+      "auto_connect": true
+    },
+    {
+      "name": "sequential-thinking",
+      "description": "Structured step-by-step reasoning for complex problems.",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
       "transport": "stdio",
       "env": {},
       "auto_connect": true
     },
     {
       "name": "filesystem",
+      "description": "Read, write, search files. Access restricted to home directory.",
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/arjun/Personal/agent-brain/workspace"],
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/arjun"],
+      "transport": "stdio",
+      "env": {},
+      "auto_connect": true
+    },
+    {
+      "name": "duckduckgo",
+      "description": "Privacy-focused web search. No API key needed.",
+      "command": "npx",
+      "args": ["-y", "duckduckgo-mcp-server"],
+      "transport": "stdio",
+      "env": {},
+      "auto_connect": true
+    },
+    {
+      "name": "context7",
+      "description": "Live docs for 9,000+ libraries. Eliminates hallucinated APIs.",
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"],
       "transport": "stdio",
       "env": {},
       "auto_connect": true
     },
     {
       "name": "github",
+      "description": "GitHub API - repos, issues, PRs, code search (requires GITHUB_TOKEN)",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "transport": "stdio",
@@ -27,20 +57,35 @@
       "auto_connect": false
     },
     {
-      "name": "sqlite",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-sqlite", "--db-path", "/tmp/agent.db"],
-      "transport": "stdio",
-      "env": {},
-      "auto_connect": false
-    },
-    {
       "name": "brave-search",
+      "description": "Web search using Brave Search API (requires BRAVE_API_KEY)",
       "command": "npx",
-      "args": ["-y", "@anthropics/mcp-server-brave-search"],
+      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
       "transport": "stdio",
       "env": {
         "BRAVE_API_KEY": "${BRAVE_API_KEY}"
+      },
+      "auto_connect": false
+    },
+    {
+      "name": "slack",
+      "description": "Slack workspace integration (requires SLACK_BOT_TOKEN)",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-slack"],
+      "transport": "stdio",
+      "env": {
+        "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}"
+      },
+      "auto_connect": false
+    },
+    {
+      "name": "postgres",
+      "description": "PostgreSQL database operations (requires DATABASE_URL)",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres"],
+      "transport": "stdio",
+      "env": {
+        "DATABASE_URL": "${DATABASE_URL}"
       },
       "auto_connect": false
     }
