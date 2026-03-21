@@ -1,0 +1,64 @@
+{
+  "_comment": "LLM Provider Configuration - Copy to provider_config.json and customize",
+
+  "_supported_providers": [
+    "anthropic - Claude models (claude-sonnet-4, claude-opus-4, etc.)",
+    "openai - GPT models (gpt-4o, gpt-4o-mini, o1, etc.)",
+    "gemini - Google models (gemini-2.0-flash, gemini-1.5-pro, etc.)",
+    "deepseek - DeepSeek models (deepseek-chat, deepseek-reasoner)",
+    "ollama - Local models (qwen2.5, llama3.3, mistral, etc.)",
+    "openrouter - 500+ models from multiple providers",
+    "groq - Fast inference (llama-3.3-70b, mixtral, etc.)",
+    "together - Open source models (Llama, Qwen, etc.)"
+  ],
+
+  "provider_type": "anthropic",
+  "api_key": "",
+  "model": "claude-sonnet-4-20250514",
+  "max_tokens": 4096,
+  "temperature": null,
+
+  "_examples": {
+    "anthropic": {
+      "provider_type": "anthropic",
+      "api_key": "sk-ant-...",
+      "model": "claude-sonnet-4-20250514"
+    },
+    "openai": {
+      "provider_type": "openai",
+      "api_key": "sk-...",
+      "model": "gpt-4o"
+    },
+    "gemini": {
+      "provider_type": "gemini",
+      "api_key": "AIza...",
+      "model": "gemini-2.0-flash"
+    },
+    "deepseek": {
+      "provider_type": "deepseek",
+      "api_key": "sk-...",
+      "model": "deepseek-chat"
+    },
+    "ollama_local": {
+      "provider_type": "ollama",
+      "api_key": "",
+      "base_url": "http://localhost:11434/v1",
+      "model": "qwen2.5:latest"
+    },
+    "openrouter": {
+      "provider_type": "openrouter",
+      "api_key": "sk-or-...",
+      "model": "anthropic/claude-3.5-sonnet"
+    },
+    "groq": {
+      "provider_type": "groq",
+      "api_key": "gsk_...",
+      "model": "llama-3.3-70b-versatile"
+    },
+    "together": {
+      "provider_type": "together",
+      "api_key": "...",
+      "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    }
+  }
+}
