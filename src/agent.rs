@@ -3,16 +3,18 @@ use std::time::Instant;
 
 use tracing::{debug, info, warn};
 
-use crate::claude::ClaudeClient;
 use crate::graph::memory::{record_tool_compositions, MemoryExtractor};
 use crate::graph::GraphBrain;
+use crate::providers::{
+    ContentBlock, ContentBlockInput, LLMProvider, Message, MessageContent, StopReason,
+};
 use crate::skills::SkillManager;
 use crate::tools::mcp_bridge::MCPBridge;
 use crate::tools::BrowserTool;
 use crate::tools::ToolRegistry;
 use crate::types::{
-    AgentConfig, AgentError, ConversationMessage, EpisodeNode, MemoryNode, TokenUsage, ToolResult,
-    ToolType,
+    AgentConfig, AgentError, ConversationMessage, EpisodeNode, MemoryNode, OperationNode,
+    TokenUsage, ToolResult, ToolType,
 };
 
 /// Maximum length for tool result content (in characters)
@@ -96,9 +98,16 @@ fn prune_conversation(messages: &mut Vec<ConversationMessage>) {
     info!("Pruned conversation to {} messages", messages.len());
 }
 
+/// Entry in the session conversation history
+#[derive(Clone, Debug)]
+pub struct ConversationEntry {
+    pub role: String, // "user" or "assistant"
+    pub content: String,
+}
+
 /// The main agent that orchestrates the ReAct loop
 pub struct Agent {
-    client: ClaudeClient,
+    provider: Arc<dyn LLMProvider>,
     registry: ToolRegistry,
     config: AgentConfig,
     brain: Arc<GraphBrain>,
@@ -107,6 +116,8 @@ pub struct Agent {
     skill_manager: Option<Arc<tokio::sync::Mutex<SkillManager>>>,
     mcp_bridge: Option<Arc<tokio::sync::Mutex<MCPBridge>>>,
     browser_tool: Option<Arc<BrowserTool>>,
+    /// Session conversation history (persists across run() calls)
+    session_history: std::sync::Mutex<Vec<ConversationEntry>>,
 }
 
 /// Result of running the agent
@@ -120,14 +131,14 @@ pub struct AgentResult {
 impl Agent {
     /// Create a new agent with graph integration
     pub fn new(
-        client: ClaudeClient,
+        provider: Arc<dyn LLMProvider>,
         registry: ToolRegistry,
         config: AgentConfig,
         brain: Arc<GraphBrain>,
         user_id: String,
     ) -> Self {
         Self {
-            client,
+            provider,
             registry,
             config,
             brain,
@@ -136,12 +147,62 @@ impl Agent {
             skill_manager: None,
             mcp_bridge: None,
             browser_tool: None,
+            session_history: std::sync::Mutex::new(Vec::new()),
         }
     }
 
-    /// Set up memory extraction with a separate API key (uses Haiku)
-    pub fn with_memory_extractor(mut self, api_key: String) -> Self {
-        self.memory_extractor = Some(MemoryExtractor::new(api_key));
+    /// Clear session conversation history
+    pub fn clear_history(&self) {
+        if let Ok(mut history) = self.session_history.lock() {
+            history.clear();
+            info!("📚 [AGENT] Session history cleared");
+        }
+    }
+
+    /// Get recent session history as context string
+    fn get_session_context(&self) -> String {
+        let history = match self.session_history.lock() {
+            Ok(h) => h,
+            Err(_) => return String::new(),
+        };
+
+        if history.is_empty() {
+            return String::new();
+        }
+
+        // Get last 5 exchanges (10 entries)
+        let recent: Vec<_> = history.iter().rev().take(10).rev().collect();
+
+        let mut context = String::from("\n\n## Recent conversation in this session:\n");
+        for entry in recent {
+            let prefix = if entry.role == "user" { "User" } else { "Assistant" };
+            let content = if entry.content.len() > 200 {
+                format!("{}...", &entry.content[..200])
+            } else {
+                entry.content.clone()
+            };
+            context.push_str(&format!("{}: {}\n", prefix, content));
+        }
+        context
+    }
+
+    /// Add entry to session history
+    fn add_to_history(&self, role: &str, content: &str) {
+        if let Ok(mut history) = self.session_history.lock() {
+            history.push(ConversationEntry {
+                role: role.to_string(),
+                content: content.to_string(),
+            });
+            // Keep only last 20 entries
+            if history.len() > 20 {
+                history.remove(0);
+            }
+        }
+    }
+
+    /// Set up memory extraction using the configured LLM provider
+    pub fn with_memory_extractor(mut self) -> Self {
+        self.memory_extractor = Some(MemoryExtractor::new(self.provider.clone()));
         self
     }
 
@@ -236,30 +297,85 @@ Be concise and helpful. Use tools when they can provide accurate information."#,
             .collect()
     }
 
+    /// Prune provider messages to keep context manageable
+    fn prune_provider_messages(messages: &mut Vec<Message>) {
+        if messages.len() <= MAX_CONVERSATION_MESSAGES {
+            return;
+        }
+
+        // Keep the first message (user's original request)
+        let first = messages.remove(0);
+
+        // Keep the last MAX_CONVERSATION_MESSAGES - 2 messages
+        let keep_count = MAX_CONVERSATION_MESSAGES - 2;
+
+        if messages.len() > keep_count {
+            let cut_index = messages.len() - keep_count;
+            messages.drain(0..cut_index);
+        }
+
+        // Add summary message and restore first
+        let summary = Message::user("[Earlier conversation pruned to manage context length. Continuing task...]");
+        messages.insert(0, summary);
+        messages.insert(0, first);
+
+        info!("Pruned conversation to {} messages", messages.len());
+    }
+
     /// Run the agent with a user message
     pub async fn run(&self, user_message: &str) -> Result<AgentResult, AgentError> {
         let start_time = Instant::now();
         let mut tools_used = Vec::new();
 
-        // Recall relevant memories
-        let keywords = Self::extract_keywords(user_message);
-        let memories = self.brain.recall(&keywords, 5).unwrap_or_default();
-        let prefs = self.brain.recall_user_prefs(&self.user_id).unwrap_or_default();
+        // Add user message to session history
+        self.add_to_history("user", user_message);
 
-        // Build dynamic system prompt
-        let system_prompt = self.build_system_prompt(&memories, &prefs);
+        // Use smart recall to get relevant memories
+        info!("📚 [AGENT] Smart recall for: \"{}\"",
+            if user_message.len() > 40 { &user_message[..40] } else { user_message });
 
-        // Create config with system prompt
-        let mut run_config = self.config.clone();
-        run_config.system_prompt = Some(system_prompt);
+        // Get scored memories (top 5 facts + top 5 preferences)
+        let scored_memories = self.brain.smart_recall(user_message, 5).unwrap_or_default();
+        let prefs = self.brain.smart_recall_prefs(user_message, 5).unwrap_or_default();
 
-        // Create a client for this run with the system prompt
-        let run_client = crate::claude::ClaudeClient::new(
-            self.client.api_key().to_string(),
-            run_config.clone(),
-        );
+        // Extract just the memories for the system prompt
+        let memories: Vec<_> = scored_memories.iter().map(|(m, _)| m.clone()).collect();
 
-        let mut messages = vec![ConversationMessage::user(user_message)];
+        if memories.is_empty() && prefs.is_empty() {
+            info!("📚 [AGENT] No relevant memories found for this query");
+        } else {
+            info!("📚 [AGENT] Using {} memories and {} preferences", memories.len(), prefs.len());
+            for (mem, score) in &scored_memories {
+                info!("📚 [AGENT]   💭 score={:.3} [{}] \"{}\"", score, mem.memory_type,
+                    if mem.content.len() > 40 { format!("{}...", &mem.content[..40]) } else { mem.content.clone() });
+            }
+            for pref in &prefs {
+                info!("📚 [AGENT]   ⭐ [pref] \"{}\"",
+                    if pref.content.len() > 40 { format!("{}...", &pref.content[..40]) } else { pref.content.clone() });
+            }
+        }
+
+        // Build dynamic system prompt with memories and session history
+        let mut system_prompt = self.build_system_prompt(&memories, &prefs);
+
+        // Add session context (previous messages in this session)
+        let session_context = self.get_session_context();
+        if !session_context.is_empty() {
+            system_prompt.push_str(&session_context);
+            info!("📚 [AGENT] Added session history to context");
+        }
+
+        // Match and inject relevant knowledge skills
+        if let Some(ref skill_manager) = self.skill_manager {
+            let skill_docs = skill_manager.lock().await.match_knowledge_skills(user_message);
+            if !skill_docs.is_empty() {
+                system_prompt.push_str(&skill_docs);
+                info!("📚 [AGENT] Injected knowledge skills into context");
+            }
+        }
+
+        // Use provider's Message type for conversation
+        let mut messages: Vec<Message> = vec![Message::user(user_message)];
         let tools = self.registry.definitions();
         let mut total_usage = TokenUsage::default();
         let mut iterations = 0;
@@ -281,21 +397,35 @@ Be concise and helpful. Use tools when they can provide accurate information."#,
                 return Err(AgentError::MaxIterationsReached);
             }
 
-            debug!("Iteration {}: Sending request to Claude", iterations);
+            info!("🤖 [AGENT] Iteration {}: Calling LLM ({} messages, {} tools)...",
+                iterations, messages.len(), tools.len());
 
-            let response = run_client.send_message(&messages, &tools).await?;
-            total_usage.add(&response.usage);
+            let response = self.provider.chat(&messages, &tools, Some(&system_prompt)).await?;
+            info!("🤖 [AGENT] LLM responded with {} content blocks", response.content.len());
+            total_usage.input_tokens += response.usage.input_tokens;
+            total_usage.output_tokens += response.usage.output_tokens;
 
             debug!(
-                "Received response with stop_reason: {}",
+                "Received response with stop_reason: {:?}",
                 response.stop_reason
             );
 
-            // Add assistant response to conversation
-            messages.push(ConversationMessage::assistant(response.content_to_json()));
+            // Convert response content to assistant message blocks
+            let assistant_blocks: Vec<ContentBlockInput> = response.content.iter().map(|block| {
+                match block {
+                    ContentBlock::Text(text) => ContentBlockInput::Text { text: text.clone() },
+                    ContentBlock::ToolCall { id, name, arguments } => ContentBlockInput::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: serde_json::to_value(arguments).unwrap_or_default(),
+                    },
+                }
+            }).collect();
+
+            messages.push(Message::assistant_blocks(assistant_blocks));
 
             // Check if we should stop
-            if response.stop_reason == "end_turn" {
+            if response.stop_reason == StopReason::EndTurn {
                 info!(
                     "Agent completed in {} iterations, tokens: in={}, out={}",
                     iterations, total_usage.input_tokens, total_usage.output_tokens
@@ -305,32 +435,68 @@ Be concise and helpful. Use tools when they can provide accurate information."#,
             }
 
             // Handle tool use
-            if response.stop_reason == "tool_use" {
+            if response.stop_reason == StopReason::ToolUse {
                 let tool_calls = response.tool_calls();
-                info!("Executing {} tool(s)", tool_calls.len());
+                let tool_names: Vec<_> = tool_calls.iter().map(|c| c.name.as_str()).collect();
+                info!("[AGENT] Executing {} tool(s): {}", tool_calls.len(), tool_names.join(", "));
 
-                let mut results = Vec::new();
-                for call in tool_calls {
-                    debug!("Executing tool: {} (id: {})", call.name, call.id);
+                let mut tool_results: Vec<(String, String, bool)> = Vec::new();
+                let mut previous_op_id: Option<String> = None;
+
+                for (seq, call) in tool_calls.iter().enumerate() {
+                    debug!("[AGENT] Tool call: {} (id: {})", call.name, call.id);
 
                     // Track tool usage
                     if !tools_used.contains(&call.name) {
                         tools_used.push(call.name.clone());
                     }
 
-                    // Dispatch based on tool type
-                    let result = self.execute_tool(&call.name, &call.id, call.input).await;
+                    // Get tool type for operation tracking
+                    let tool_type = self.registry.get_tool_type(&call.name).cloned().unwrap_or(ToolType::Native);
+
+                    // Create operation record
+                    let mut operation = OperationNode::new(
+                        "session".to_string(), // Task ID (session-level for now)
+                        seq as u32 + 1,
+                        call.name.clone(),
+                        tool_type,
+                        serde_json::to_value(&call.arguments).unwrap_or_default(),
+                    );
+
+                    // Chain operations together
+                    if let Some(prev_id) = &previous_op_id {
+                        operation = operation.chain_from(prev_id.clone());
+                    }
+
+                    // Execute and time the tool
+                    let op_start = std::time::Instant::now();
+                    let result = self.execute_tool(&call.name, &call.id, call.arguments.clone()).await;
+                    let duration_ms = op_start.elapsed().as_millis() as u64;
+
+                    // Update operation with results
+                    let output_truncated = result.content.len() > MAX_TOOL_RESULT_LENGTH;
+                    if result.is_error {
+                        operation.fail(result.content.clone(), duration_ms);
+                    } else {
+                        operation.complete(result.content.clone(), duration_ms, output_truncated);
+                    }
 
                     debug!(
-                        "Tool {} result: {} (is_error: {})",
+                        "Tool {} result: {} (is_error: {}, {}ms)",
                         call.name,
                         if result.content.len() > 100 {
                             format!("{}...", &result.content[..100])
                         } else {
                             result.content.clone()
                         },
-                        result.is_error
+                        result.is_error,
+                        duration_ms
                     );
+
+                    // Record operation in graph (fire and forget)
+                    if let Ok(op_id) = self.brain.record_operation(&operation) {
+                        previous_op_id = Some(op_id);
+                    }
 
                     // Update tool stats in graph
                     self.brain
@@ -338,17 +504,18 @@ Be concise and helpful. Use tools when they can provide accurate information."#,
                         .ok();
 
                     // Truncate result to manage tokens
-                    results.push(truncate_tool_result(result));
+                    let truncated = truncate_tool_result(result);
+                    tool_results.push((truncated.tool_use_id, truncated.content, truncated.is_error));
                 }
 
                 // Add tool results to conversation
-                messages.push(ConversationMessage::tool_results(results));
+                messages.push(Message::tool_results(tool_results));
 
                 // Prune conversation if getting too long
-                prune_conversation(&mut messages);
+                Self::prune_provider_messages(&mut messages);
             } else {
                 // Unexpected stop reason
-                warn!("Unexpected stop_reason: {}", response.stop_reason);
+                warn!("Unexpected stop_reason: {:?}", response.stop_reason);
                 response_text = response.text();
                 break;
             }
@@ -356,6 +523,10 @@ Be concise and helpful. Use tools when they can provide accurate information."#,
 
         let duration_ms = start_time.elapsed().as_millis() as i64;
         let tokens_used = (total_usage.input_tokens + total_usage.output_tokens) as i64;
+
+        // Add response to session history
+        self.add_to_history("assistant", &response_text);
+        debug!("📚 [AGENT] Added response to session history");
 
         // Record tool compositions
         if tools_used.len() >= 2 {
@@ -387,6 +558,7 @@ Be concise and helpful. Use tools when they can provide accurate information."#,
 
         // Extract and store memories (async, don't block response)
         if let (Some(ref extractor), Some(ref ep_id)) = (&self.memory_extractor, &episode_id) {
+            info!("🧠 [AGENT] Spawning background memory extraction task...");
             let brain = self.brain.clone();
             let user_id = self.user_id.clone();
             let user_input = user_message.to_string();
@@ -397,6 +569,7 @@ Be concise and helpful. Use tools when they can provide accurate information."#,
 
             // Spawn memory extraction as background task
             tokio::spawn(async move {
+                info!("🧠 [BACKGROUND] Memory extraction started for episode: {}", &episode_id[..8]);
                 if let Err(e) = extractor_clone
                     .extract_and_store(
                         &brain,
@@ -408,9 +581,13 @@ Be concise and helpful. Use tools when they can provide accurate information."#,
                     )
                     .await
                 {
-                    warn!("Memory extraction failed: {}", e);
+                    warn!("🧠 [BACKGROUND] Memory extraction failed: {}", e);
+                } else {
+                    info!("🧠 [BACKGROUND] Memory extraction completed successfully");
                 }
             });
+        } else {
+            debug!("🧠 [AGENT] Memory extraction skipped (no extractor or episode)");
         }
 
         Ok(AgentResult {

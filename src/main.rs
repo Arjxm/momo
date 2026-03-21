@@ -1,42 +1,38 @@
 mod agent;
 mod claude;
 mod config;
+mod debug_server;
 mod graph;
+mod orchestrator;
+mod providers;
 mod skills;
 mod tools;
+mod tui;
 mod types;
 
-use std::io::{self, BufRead, Write};
 use std::sync::Arc;
+use std::time::Duration;
 
-use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
+use crossterm::event::{Event, KeyCode, KeyEventKind};
+
+use crate::tui::{App, Tui};
 
 use crate::agent::Agent;
-use crate::claude::ClaudeClient;
 use crate::config::AppConfig;
 use crate::graph::GraphBrain;
+use crate::orchestrator::Orchestrator;
+use crate::providers::{create_provider, ProviderConfig, ProviderType};
 use crate::skills::SkillManager;
 use crate::tools::mcp_bridge::MCPBridge;
-use crate::tools::{ArxivSearch, BrowserTool, Calculator, Tool, ToolRegistry, WebFetch};
+use crate::tools::{
+    ArxivSearch, BrowserTool, Calculator, ExchangeRates, HackerNews, Tool, ToolRegistry, Weather,
+    WebFetch, Wikipedia,
+};
 use crate::types::{AgentConfig, ToolNode, ToolType};
 
 // Cost per million tokens (approximate for Claude Sonnet)
 const INPUT_COST_PER_MILLION: f64 = 3.0;
 const OUTPUT_COST_PER_MILLION: f64 = 15.0;
-
-fn print_banner() {
-    println!();
-    println!("  ___                  _     ___          _      ");
-    println!(" / _ \\                | |   | _ )_ _ __ _(_)_ _  ");
-    println!("| |_| |__ _ ___ _ _  _| |_  | _ \\ '_/ _` | | ' \\ ");
-    println!(" \\___/___| '_  | '_||_____|_|___/_| \\__,_|_|_||_|");
-    println!("         |_| |_|_|                               ");
-    println!();
-    println!("Welcome to Agent Brain v0.2 - AI assistant with persistent memory");
-    println!("Type your questions or commands. Type 'quit', 'exit', or 'stats' for info.");
-    println!();
-}
 
 fn estimate_cost(input_tokens: u32, output_tokens: u32) -> f64 {
     let input_cost = (input_tokens as f64 / 1_000_000.0) * INPUT_COST_PER_MILLION;
@@ -46,16 +42,8 @@ fn estimate_cost(input_tokens: u32, output_tokens: u32) -> f64 {
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("agent_brain=info".parse().unwrap())
-                .add_directive("reqwest=warn".parse().unwrap())
-                .add_directive("chromiumoxide=warn".parse().unwrap())
-                .add_directive("ladybugdb=warn".parse().unwrap()),
-        )
-        .init();
+    // Note: We don't initialize tracing to stdout since TUI captures the terminal.
+    // Logs are captured internally by the TUI app state.
 
     // Load environment variables from .env file
     if let Err(e) = dotenvy::dotenv() {
@@ -74,8 +62,11 @@ async fn main() {
         }
     };
 
+    // Collect startup messages for TUI
+    let mut startup_logs: Vec<String> = Vec::new();
+
     // Initialize the graph brain
-    info!("Initializing graph brain at: {}", app_config.db_path);
+    startup_logs.push(format!("Initializing graph brain at: {}", app_config.db_path));
     let brain = match GraphBrain::open(&app_config.db_path) {
         Ok(brain) => Arc::new(brain),
         Err(e) => {
@@ -89,7 +80,7 @@ async fn main() {
 
     // Register native tools
     let native_tools = register_native_tools(&mut registry, &brain);
-    info!("Registered {} native tools", native_tools.len());
+    startup_logs.push(format!("Registered {} native tools", native_tools.len()));
 
     // Initialize skill manager
     let skill_manager = Arc::new(tokio::sync::Mutex::new(SkillManager::new(
@@ -120,7 +111,7 @@ async fn main() {
             }
         }
     };
-    info!("Loaded {} user skills", skill_tools.len());
+    startup_logs.push(format!("Loaded {} user skills", skill_tools.len()));
 
     // Initialize MCP bridge
     let mcp_bridge = Arc::new(tokio::sync::Mutex::new(MCPBridge::new(brain.clone())));
@@ -144,112 +135,251 @@ async fn main() {
                 ToolType::Mcp,
             );
         }
-        info!("Connected to {} MCP servers", bridge.connected_servers().len());
+        startup_logs.push(format!("Connected to {} MCP servers", bridge.connected_servers().len()));
     }
 
     // Register browser tool
     let browser = Arc::new(BrowserTool::new());
     registry.register_with_type(browser.as_ref().clone(), ToolType::Browser);
-    info!("Browser tool registered");
+    startup_logs.push("Browser tool registered".to_string());
+
+    // Create provider configuration
+    let provider_config = ProviderConfig {
+        provider_type: match app_config.provider.provider_type.as_str() {
+            "anthropic" => ProviderType::Anthropic,
+            "openai" => ProviderType::OpenAI,
+            "gemini" => ProviderType::Gemini,
+            "deepseek" => ProviderType::DeepSeek,
+            "ollama" => ProviderType::Ollama,
+            "openrouter" => ProviderType::OpenRouter,
+            "groq" => ProviderType::Groq,
+            "together" => ProviderType::Together,
+            "lmstudio" => ProviderType::LMStudio,
+            _ => ProviderType::Custom,
+        },
+        api_key: app_config.provider.api_key.clone(),
+        base_url: app_config.provider.base_url.clone(),
+        model: app_config.provider.model.clone(),
+        max_tokens: app_config.provider.max_tokens,
+        temperature: app_config.provider.temperature,
+        extra: std::collections::HashMap::new(),
+    };
+
+    // Create the LLM provider
+    let llm_provider: Arc<dyn providers::LLMProvider> = match create_provider(provider_config.clone()) {
+        Ok(p) => Arc::from(p),
+        Err(e) => {
+            eprintln!("Error creating LLM provider: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let provider_name = llm_provider.name().to_string();
+    let model_name = llm_provider.model().to_string();
 
     // Create agent configuration
-    let agent_config = AgentConfig::default();
+    let agent_config = AgentConfig {
+        model: app_config.provider.model.clone(),
+        max_tokens: app_config.provider.max_tokens,
+        ..AgentConfig::default()
+    };
 
-    // Create Claude client
-    let client = ClaudeClient::new(app_config.anthropic_api_key.clone(), agent_config.clone());
+    // Create a second registry for orchestrator
+    let mut orchestrator_registry = ToolRegistry::new();
+
+    // Re-register native tools for orchestrator
+    orchestrator_registry.register(Calculator::new());
+    orchestrator_registry.register(ArxivSearch::new());
+    orchestrator_registry.register(WebFetch::new());
+    orchestrator_registry.register(HackerNews::new());
+    orchestrator_registry.register(Weather::new());
+    orchestrator_registry.register(ExchangeRates::new());
+    orchestrator_registry.register(Wikipedia::new());
+
+    // Register MCP tools for orchestrator
+    {
+        let mcp_tools = brain.get_tools_by_type("mcp").unwrap_or_default();
+        for tool in &mcp_tools {
+            orchestrator_registry.register_with_type(
+                MCPToolWrapper {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    input_schema: tool.input_schema.clone(),
+                },
+                ToolType::Mcp,
+            );
+        }
+    }
 
     // Create the agent
     let agent = Agent::new(
-        client,
+        llm_provider.clone(),
         registry,
         agent_config,
         brain.clone(),
         app_config.default_user_id.clone(),
     )
-    .with_memory_extractor(app_config.anthropic_api_key.clone())
-    .with_skill_manager(skill_manager)
-    .with_mcp_bridge(mcp_bridge)
+    .with_memory_extractor()
+    .with_skill_manager(skill_manager.clone())
+    .with_mcp_bridge(mcp_bridge.clone())
     .with_browser(browser.clone());
 
-    // Print startup summary
-    print_banner();
-    if let Ok(stats) = brain.stats() {
-        println!("{}", stats);
+    // Create the orchestrator for complex multi-task operations
+    let orchestrator = Orchestrator::new(
+        llm_provider.clone(),
+        orchestrator_registry,
+        brain.clone(),
+        app_config.skills_dir.clone().into(),
+    )
+    .with_mcp_bridge(mcp_bridge)
+    .with_skill_manager(skill_manager)
+    .with_browser(browser.clone());
+
+    // Wrap agent and orchestrator in Arc for sharing across tasks
+    let agent = Arc::new(agent);
+    let orchestrator = Arc::new(orchestrator);
+
+    // Create TUI app state
+    let app = Arc::new(std::sync::Mutex::new(App::new()));
+
+    // Add startup info to logs
+    {
+        let mut app_guard = app.lock().unwrap();
+        app_guard.add_log("INFO", "Agent Brain v0.3 started");
+        app_guard.add_log("INFO", &format!("Provider: {} | Model: {}", provider_name, model_name));
+        // Add collected startup logs
+        for msg in &startup_logs {
+            app_guard.add_log("INFO", msg);
+        }
+        if let Ok(stats) = brain.stats() {
+            app_guard.add_log("INFO", &stats.to_string());
+        }
+        app_guard.status = format!("Ready | {} | {}", provider_name, model_name);
     }
-    println!();
 
-    // Interactive REPL
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let mut total_input_tokens = 0u32;
-    let mut total_output_tokens = 0u32;
+    // Create TUI
+    let mut tui = match Tui::new() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Failed to initialize TUI: {}", e);
+            std::process::exit(1);
+        }
+    };
 
+    // Main TUI event loop
     loop {
-        print!("> ");
-        stdout.flush().unwrap();
-
-        let mut input = String::new();
-        match stdin.lock().read_line(&mut input) {
-            Ok(0) => {
-                println!("\nGoodbye!");
-                break;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                error!("Error reading input: {}", e);
-                continue;
-            }
-        }
-
-        let input = input.trim();
-        if input.is_empty() {
-            continue;
-        }
-
-        // Handle special commands
-        if input.eq_ignore_ascii_case("quit") || input.eq_ignore_ascii_case("exit") {
-            print_session_summary(total_input_tokens, total_output_tokens, &brain);
+        // Draw the UI
+        if let Err(e) = tui.draw(&app.lock().unwrap()) {
+            eprintln!("Draw error: {}", e);
             break;
         }
 
-        if input.eq_ignore_ascii_case("stats") {
-            print_stats(&brain);
-            continue;
+        // Check if we should quit
+        if app.lock().unwrap().should_quit {
+            break;
         }
 
-        // Run the agent
-        println!();
-        match agent.run(input).await {
-            Ok(result) => {
-                println!("{}", result.response);
-                println!();
+        // Check for pending input to process
+        let pending = app.lock().unwrap().pending_input.take();
+        if let Some(input) = pending {
+            // Clone what we need for the async task
+            let agent_clone = agent.clone();
+            let app_clone = app.clone();
 
-                let tools_str = if result.tools_used.is_empty() {
-                    String::new()
-                } else {
-                    format!(" | Tools: {}", result.tools_used.join(", "))
-                };
+            // Process special commands
+            match input.to_lowercase().as_str() {
+                "stats" => {
+                    let mut app_guard = app_clone.lock().unwrap();
+                    if let Ok(stats) = brain.stats() {
+                        app_guard.add_assistant_message(&stats.to_string(), (0, 0), vec![]);
+                    }
+                    app_guard.is_thinking = false;
+                    app_guard.status = "Ready".to_string();
+                }
+                "debug" => {
+                    let debug_brain = brain.clone();
+                    tokio::spawn(async move {
+                        debug_server::start_debug_server(debug_brain, 3030).await;
+                    });
+                    let mut app_guard = app_clone.lock().unwrap();
+                    app_guard.add_assistant_message(
+                        "Debug server started at http://localhost:3030",
+                        (0, 0),
+                        vec![],
+                    );
+                    app_guard.is_thinking = false;
+                    app_guard.status = "Debug server running".to_string();
+                }
+                _ => {
+                    // Run the agent in a background task
+                    tokio::spawn(async move {
+                        {
+                            let mut app_guard = app_clone.lock().unwrap();
+                            app_guard.add_log("INFO", &format!("Processing: {}", input));
+                        }
 
-                println!(
-                    "[Tokens: {} in, {} out | Cost: ${:.4}{}]",
-                    result.usage.input_tokens,
-                    result.usage.output_tokens,
-                    estimate_cost(result.usage.input_tokens, result.usage.output_tokens),
-                    tools_str
-                );
-
-                total_input_tokens += result.usage.input_tokens;
-                total_output_tokens += result.usage.output_tokens;
-            }
-            Err(e) => {
-                eprintln!("Error: {}", e);
+                        match agent_clone.run(&input).await {
+                            Ok(result) => {
+                                let mut app_guard = app_clone.lock().unwrap();
+                                app_guard.add_assistant_message(
+                                    &result.response,
+                                    (result.usage.input_tokens, result.usage.output_tokens),
+                                    result.tools_used,
+                                );
+                                app_guard.is_thinking = false;
+                                app_guard.status = "Ready".to_string();
+                                app_guard.add_log(
+                                    "INFO",
+                                    &format!(
+                                        "Response complete: {} in, {} out tokens",
+                                        result.usage.input_tokens, result.usage.output_tokens
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                let mut app_guard = app_clone.lock().unwrap();
+                                app_guard.add_assistant_message(
+                                    &format!("Error: {}", e),
+                                    (0, 0),
+                                    vec![],
+                                );
+                                app_guard.is_thinking = false;
+                                app_guard.status = "Error occurred".to_string();
+                                app_guard.add_log("ERROR", &format!("Agent error: {}", e));
+                            }
+                        }
+                    });
+                }
             }
         }
-        println!();
+
+        // Poll for events
+        if let Ok(Some(event)) = tui.poll_event(Duration::from_millis(50)) {
+            if let Event::Key(key) = event {
+                if key.kind == KeyEventKind::Press {
+                    let mut app_guard = app.lock().unwrap();
+                    app_guard.handle_key(key.code, key.modifiers);
+                }
+            }
+        }
     }
 
-    // Cleanup browser
+    // Cleanup
+    tui.restore().ok();
     browser.cleanup().await;
+
+    // Print session summary
+    let app_guard = app.lock().unwrap();
+    println!("\nSession summary:");
+    println!(
+        "  Total tokens: {} input, {} output",
+        app_guard.total_tokens.0, app_guard.total_tokens.1
+    );
+    println!(
+        "  Estimated cost: ${:.4}",
+        estimate_cost(app_guard.total_tokens.0, app_guard.total_tokens.1)
+    );
+    println!("\nGoodbye!");
 }
 
 /// Register native tools and add them to the graph
@@ -302,36 +432,74 @@ fn register_native_tools(registry: &mut ToolRegistry, brain: &Arc<GraphBrain>) -
     registry.register(web);
     tools.push(web_node);
 
+    // === Free REST API Tools (zero API key required) ===
+
+    // Hacker News
+    let hn = HackerNews::new();
+    let hn_def = hn.definition();
+    let hn_node = ToolNode::new(
+        hn_def.name.clone(),
+        hn_def.description.clone(),
+        ToolType::Native,
+        hn_def.input_schema.clone(),
+        "free_api".to_string(),
+    );
+    brain.register_tool(&hn_node).ok();
+    brain.link_tool_topic(&hn_node.name, "news").ok();
+    brain.link_tool_topic(&hn_node.name, "tech").ok();
+    registry.register(hn);
+    tools.push(hn_node);
+
+    // Weather (Open-Meteo)
+    let weather = Weather::new();
+    let weather_def = weather.definition();
+    let weather_node = ToolNode::new(
+        weather_def.name.clone(),
+        weather_def.description.clone(),
+        ToolType::Native,
+        weather_def.input_schema.clone(),
+        "free_api".to_string(),
+    );
+    brain.register_tool(&weather_node).ok();
+    brain.link_tool_topic(&weather_node.name, "weather").ok();
+    registry.register(weather);
+    tools.push(weather_node);
+
+    // Exchange Rates
+    let exchange = ExchangeRates::new();
+    let exchange_def = exchange.definition();
+    let exchange_node = ToolNode::new(
+        exchange_def.name.clone(),
+        exchange_def.description.clone(),
+        ToolType::Native,
+        exchange_def.input_schema.clone(),
+        "free_api".to_string(),
+    );
+    brain.register_tool(&exchange_node).ok();
+    brain.link_tool_topic(&exchange_node.name, "finance").ok();
+    brain.link_tool_topic(&exchange_node.name, "currency").ok();
+    registry.register(exchange);
+    tools.push(exchange_node);
+
+    // Wikipedia
+    let wiki = Wikipedia::new();
+    let wiki_def = wiki.definition();
+    let wiki_node = ToolNode::new(
+        wiki_def.name.clone(),
+        wiki_def.description.clone(),
+        ToolType::Native,
+        wiki_def.input_schema.clone(),
+        "free_api".to_string(),
+    );
+    brain.register_tool(&wiki_node).ok();
+    brain.link_tool_topic(&wiki_node.name, "knowledge").ok();
+    brain.link_tool_topic(&wiki_node.name, "reference").ok();
+    registry.register(wiki);
+    tools.push(wiki_node);
+
     tools
 }
 
-fn print_stats(brain: &Arc<GraphBrain>) {
-    if let Ok(stats) = brain.stats() {
-        println!();
-        println!("{}", stats);
-        println!();
-    } else {
-        println!("Failed to get graph stats.");
-    }
-}
-
-fn print_session_summary(input_tokens: u32, output_tokens: u32, brain: &Arc<GraphBrain>) {
-    println!("\nSession summary:");
-    println!(
-        "  Total tokens: {} input, {} output",
-        input_tokens, output_tokens
-    );
-    println!(
-        "  Estimated cost: ${:.4}",
-        estimate_cost(input_tokens, output_tokens)
-    );
-
-    if let Ok(stats) = brain.stats() {
-        println!("  {}", stats);
-    }
-
-    println!("\nGoodbye!");
-}
 
 // ═══════════════════════════════════════════════════════════════════
 // TOOL WRAPPERS
