@@ -1,14 +1,14 @@
 //! Memory extraction after each agent interaction.
-//! Uses Claude Haiku (cheap, fast) to extract facts from conversations.
+//! Uses the configured LLM provider to extract facts from conversations.
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::claude::ClaudeClient;
 use crate::graph::GraphBrain;
-use crate::types::{AgentConfig, AgentError, ConversationMessage, MemoryNode, MemoryType};
+use crate::providers::{LLMProvider, Message};
+use crate::types::{AgentError, MemoryNode, MemoryType};
 
 /// Extracted memory from an interaction
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,31 +19,23 @@ pub struct ExtractedMemory {
     pub topics: Vec<String>,
 }
 
-/// Memory extractor that uses Claude Haiku to extract facts from conversations
+/// Memory extractor that uses the configured LLM provider to extract facts from conversations
 pub struct MemoryExtractor {
-    client: ClaudeClient,
-    api_key: String,
+    provider: Arc<dyn LLMProvider>,
 }
 
 impl MemoryExtractor {
-    /// Create a new memory extractor with a Haiku-configured client
-    pub fn new(api_key: String) -> Self {
-        let config = AgentConfig {
-            model: "claude-3-haiku-20240307".to_string(),
-            max_tokens: 1024,
-            max_iterations: 1,
-            system_prompt: None,
-        };
-        Self {
-            client: ClaudeClient::new(api_key.clone(), config),
-            api_key,
-        }
+    /// Create a new memory extractor with the given LLM provider
+    pub fn new(provider: Arc<dyn LLMProvider>) -> Self {
+        Self { provider }
     }
 }
 
 impl Clone for MemoryExtractor {
     fn clone(&self) -> Self {
-        Self::new(self.api_key.clone())
+        Self {
+            provider: self.provider.clone(),
+        }
     }
 }
 
@@ -58,22 +50,32 @@ impl MemoryExtractor {
         tools_used: &[String],
         episode_id: &str,
     ) -> Result<Vec<MemoryNode>, AgentError> {
+        info!("🧠 [MEMORY] Starting memory extraction from interaction");
+        debug!("🧠 [MEMORY] User input: {}", truncate(user_input, 100));
+        debug!("🧠 [MEMORY] Tools used: {:?}", tools_used);
+
         // Build the extraction prompt
         let prompt = build_extraction_prompt(user_input, agent_response, tools_used);
 
-        // Call Claude Haiku to extract memories
-        let messages = vec![ConversationMessage::user(&prompt)];
-        let response = self.client.send_message(&messages, &[]).await?;
+        // Call LLM provider to extract memories
+        info!("🧠 [MEMORY] Calling LLM to extract facts/preferences...");
+        let messages = vec![Message::user(&prompt)];
+        let response = self.provider.chat(&messages, &[], None).await?;
 
         // Parse the JSON response
         let extracted = parse_extraction_response(&response.text())?;
 
         if extracted.is_empty() {
-            debug!("No new memories extracted from interaction");
+            info!("🧠 [MEMORY] No new memories extracted from this interaction");
             return Ok(Vec::new());
         }
 
-        info!("Extracted {} memories from interaction", extracted.len());
+        info!("🧠 [MEMORY] Extracted {} memories from interaction:", extracted.len());
+        for (i, mem) in extracted.iter().enumerate() {
+            info!("🧠 [MEMORY]   {}. [{}] (importance: {:.2}) \"{}\"",
+                i + 1, mem.memory_type, mem.importance, truncate(&mem.content, 60));
+            debug!("🧠 [MEMORY]      Topics: {:?}", mem.topics);
+        }
 
         // Store each extracted memory
         let mut stored_memories = Vec::new();
@@ -87,29 +89,44 @@ impl MemoryExtractor {
             };
 
             // Check for contradictions
+            debug!("🧠 [MEMORY] Checking for contradictions with topics: {:?}", ext.topics);
             let contradictions = find_contradictions(brain, &ext.topics, &memory_type)?;
 
-            // Create the memory node
-            let memory = MemoryNode::new(ext.content.clone(), memory_type.clone(), ext.importance);
+            // Create the memory node with provenance
+            // Note: episode_id can be used as task_id for now
+            let memory = MemoryNode::with_provenance(
+                ext.content.clone(),
+                memory_type.clone(),
+                ext.importance,
+                Some(episode_id.to_string()), // source_task_id
+                None, // source_operation_id (could be enhanced later)
+            );
 
             // Handle contradictions
             for old_memory in contradictions {
                 if memories_contradict(&old_memory.content, &memory.content) {
-                    info!(
-                        "Found contradiction: '{}' contradicts '{}'",
-                        memory.content, old_memory.content
+                    warn!(
+                        "🧠 [MEMORY] ⚠️ CONTRADICTION DETECTED:\n   OLD: \"{}\"\n   NEW: \"{}\"",
+                        old_memory.content, memory.content
                     );
 
                     // Invalidate old memory
                     brain.invalidate_memory(&old_memory.id)?;
+                    info!("🧠 [MEMORY] Invalidated old memory: {}", old_memory.id);
 
-                    // Create contradiction edge
+                    // Create contradiction and supersedes edges
                     brain.link_contradiction(&memory.id, &old_memory.id)?;
+                    brain.link_supersedes(&memory.id, &old_memory.id)?;
                 }
             }
 
-            // Store the new memory
-            brain.remember(&memory, &ext.topics)?;
+            // Store the new memory with deduplication
+            let (stored_id, was_duplicate) = brain.remember_with_dedup(&memory, &ext.topics)?;
+            if was_duplicate {
+                info!("🧠 [MEMORY] 🔄 Existing memory found: \"{}\" (id: {})", truncate(&memory.content, 50), &stored_id[..8]);
+            } else {
+                info!("🧠 [MEMORY] ✅ Stored new memory: \"{}\" (id: {})", truncate(&memory.content, 50), &stored_id[..8]);
+            }
 
             // Link to episode
             link_memory_to_episode(brain, &memory.id, episode_id)?;
@@ -117,11 +134,13 @@ impl MemoryExtractor {
             // If it's a preference, link to user
             if memory_type == MemoryType::Preference {
                 brain.link_user_preference(user_id, &memory.id)?;
+                debug!("🧠 [MEMORY] Linked preference to user: {}", user_id);
             }
 
             stored_memories.push(memory);
         }
 
+        info!("🧠 [MEMORY] Memory extraction complete. Stored {} new memories.", stored_memories.len());
         Ok(stored_memories)
     }
 }

@@ -269,6 +269,87 @@ impl std::str::FromStr for ToolType {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// OPERATION NODE (Tool Execution Record)
+// ═══════════════════════════════════════════════════════════════════
+
+/// An operation represents a single tool execution within a task
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationNode {
+    pub id: String,
+    /// Which task triggered this operation
+    pub task_id: String,
+    /// Order within task (1st, 2nd, etc.)
+    pub sequence: u32,
+    /// Name of the tool executed
+    pub tool_name: String,
+    /// Type of tool (Native, MCP, Skill, Browser)
+    pub tool_type: ToolType,
+    /// Input arguments as JSON
+    pub inputs: serde_json::Value,
+    /// Output from tool execution
+    pub output: String,
+    /// Whether output was truncated
+    pub output_truncated: bool,
+    /// Execution duration in milliseconds
+    pub duration_ms: u64,
+    /// Whether execution succeeded
+    pub success: bool,
+    /// Error message if failed
+    pub error: Option<String>,
+    /// Previous operation ID if this was chained
+    pub previous_op_id: Option<String>,
+    /// Timestamp when operation was created/executed
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl OperationNode {
+    pub fn new(
+        task_id: String,
+        sequence: u32,
+        tool_name: String,
+        tool_type: ToolType,
+        inputs: serde_json::Value,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id,
+            sequence,
+            tool_name,
+            tool_type,
+            inputs,
+            output: String::new(),
+            output_truncated: false,
+            duration_ms: 0,
+            success: false,
+            error: None,
+            previous_op_id: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Complete the operation with results
+    pub fn complete(&mut self, output: String, duration_ms: u64, truncated: bool) {
+        self.output = output;
+        self.duration_ms = duration_ms;
+        self.output_truncated = truncated;
+        self.success = true;
+    }
+
+    /// Mark the operation as failed
+    pub fn fail(&mut self, error: String, duration_ms: u64) {
+        self.error = Some(error);
+        self.duration_ms = duration_ms;
+        self.success = false;
+    }
+
+    /// Chain this operation to a previous one
+    pub fn chain_from(mut self, previous_op_id: String) -> Self {
+        self.previous_op_id = Some(previous_op_id);
+        self
+    }
+}
+
 /// A tool node in the graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolNode {
@@ -400,29 +481,140 @@ impl std::fmt::Display for MemoryType {
 pub struct MemoryNode {
     pub id: String,
     pub content: String,
+    /// SHA256 fingerprint for deduplication
+    pub fingerprint: String,
     pub memory_type: MemoryType,
     pub importance: f64,
+    /// Provenance: which task learned this memory
+    pub source_task_id: Option<String>,
+    /// Provenance: which operation produced this memory
+    pub source_operation_id: Option<String>,
+    /// Last time this memory was accessed/retrieved
+    pub last_accessed: chrono::DateTime<chrono::Utc>,
+    /// Number of times this memory has been accessed
+    pub access_count: u32,
+    /// Task IDs that have recalled/used this memory
+    pub tasks_used_in: Vec<String>,
     pub valid_from: chrono::DateTime<chrono::Utc>,
     pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// ID of memory that supersedes this one (if invalidated)
+    pub superseded_by: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl MemoryNode {
     pub fn new(content: String, memory_type: MemoryType, importance: f64) -> Self {
         let now = chrono::Utc::now();
+        let fingerprint = Self::compute_fingerprint(&content);
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             content,
+            fingerprint,
             memory_type,
             importance: importance.clamp(0.0, 1.0),
+            source_task_id: None,
+            source_operation_id: None,
+            last_accessed: now,
+            access_count: 0,
+            tasks_used_in: Vec::new(),
             valid_from: now,
             valid_until: None,
+            superseded_by: None,
             created_at: now,
         }
     }
 
+    /// Create a memory with full provenance
+    pub fn with_provenance(
+        content: String,
+        memory_type: MemoryType,
+        importance: f64,
+        source_task_id: Option<String>,
+        source_operation_id: Option<String>,
+    ) -> Self {
+        let mut memory = Self::new(content, memory_type, importance);
+        memory.source_task_id = source_task_id;
+        memory.source_operation_id = source_operation_id;
+        memory
+    }
+
+    /// Compute SHA256 fingerprint for content deduplication
+    pub fn compute_fingerprint(content: &str) -> String {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        // Normalize: lowercase, trim whitespace, collapse spaces
+        let normalized = content
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        hasher.update(normalized.as_bytes());
+        let result = hasher.finalize();
+        format!("{:x}", result)
+    }
+
+    /// Record that this memory was used in a task
+    pub fn record_usage(&mut self, task_id: &str) {
+        if !self.tasks_used_in.contains(&task_id.to_string()) {
+            self.tasks_used_in.push(task_id.to_string());
+        }
+        self.access_count += 1;
+        self.last_accessed = chrono::Utc::now();
+    }
+
     pub fn is_valid(&self) -> bool {
         self.valid_until.is_none()
+    }
+
+    /// Calculate recency score (1.0 for recent, decays over time)
+    /// Half-life of ~7 days
+    pub fn recency_score(&self) -> f64 {
+        let now = chrono::Utc::now();
+        let hours_since_access = (now - self.last_accessed).num_hours() as f64;
+        let days_since_access = hours_since_access / 24.0;
+
+        // Exponential decay with 7-day half-life
+        // score = e^(-0.099 * days) ≈ 0.5 after 7 days
+        (-0.099 * days_since_access).exp()
+    }
+
+    /// Calculate access frequency score (logarithmic scale)
+    pub fn frequency_score(&self) -> f64 {
+        // Log scale: 0 accesses = 0.1, 1 = 0.3, 10 = 0.5, 100 = 0.7
+        (1.0 + self.access_count as f64).ln() / 10.0 + 0.1
+    }
+
+    /// Calculate overall relevance score for a query
+    /// Combines: importance, recency, frequency, and keyword match
+    pub fn relevance_score(&self, keyword_match_score: f64) -> f64 {
+        let weights = MemoryScoreWeights::default();
+
+        let score = (self.importance * weights.importance)
+            + (self.recency_score() * weights.recency)
+            + (self.frequency_score().min(1.0) * weights.frequency)
+            + (keyword_match_score * weights.keyword_match);
+
+        score.clamp(0.0, 1.0)
+    }
+}
+
+/// Weights for memory scoring
+#[derive(Debug, Clone)]
+pub struct MemoryScoreWeights {
+    pub importance: f64,
+    pub recency: f64,
+    pub frequency: f64,
+    pub keyword_match: f64,
+}
+
+impl Default for MemoryScoreWeights {
+    fn default() -> Self {
+        Self {
+            importance: 0.25,    // Base importance from extraction
+            recency: 0.30,       // How recently accessed
+            frequency: 0.15,     // How often accessed
+            keyword_match: 0.30, // How well it matches query
+        }
     }
 }
 
