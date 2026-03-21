@@ -1,6 +1,12 @@
 # MOMO - Memory-Oriented Model Orchestrator
 
-An autonomous AI agent built in Rust with persistent graph-based memory, multi-provider LLM support, and extensible tool architecture. MOMO learns from every interaction, building a knowledge graph that makes it smarter over time.
+[![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
+[![GitHub Stars](https://img.shields.io/github/stars/Arjxm/momo?style=for-the-badge)](https://github.com/Arjxm/momo/stargazers)
+
+An autonomous AI agent built in Rust with **persistent graph-based memory**, multi-provider LLM support, and extensible tool architecture. MOMO learns from every interaction, building a knowledge graph that makes it smarter over time.
+
+**Unlike stateless AI agents, MOMO remembers.** It extracts facts and preferences from conversations, detects contradictions, and uses smart recall to surface relevant memories when you need them.
 
 > **Status:** Active Development - Core memory and agent loop functional, orchestrator in progress
 
