@@ -10,7 +10,6 @@ use crate::providers::{
 };
 use crate::skills::SkillManager;
 use crate::tools::mcp_bridge::MCPBridge;
-use crate::tools::BrowserTool;
 use crate::tools::ToolRegistry;
 use crate::types::{
     AgentConfig, AgentError, ConversationMessage, EpisodeNode, MemoryNode, OperationNode,
@@ -115,7 +114,6 @@ pub struct Agent {
     memory_extractor: Option<MemoryExtractor>,
     skill_manager: Option<Arc<tokio::sync::Mutex<SkillManager>>>,
     mcp_bridge: Option<Arc<tokio::sync::Mutex<MCPBridge>>>,
-    browser_tool: Option<Arc<BrowserTool>>,
     /// Session conversation history (persists across run() calls)
     session_history: std::sync::Mutex<Vec<ConversationEntry>>,
 }
@@ -146,7 +144,6 @@ impl Agent {
             memory_extractor: None,
             skill_manager: None,
             mcp_bridge: None,
-            browser_tool: None,
             session_history: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -218,14 +215,13 @@ impl Agent {
         self
     }
 
-    /// Set up browser tool
-    pub fn with_browser(mut self, browser: Arc<BrowserTool>) -> Self {
-        self.browser_tool = Some(browser);
-        self
-    }
-
-    /// Build the dynamic system prompt with memories and context
-    fn build_system_prompt(&self, memories: &[MemoryNode], prefs: &[MemoryNode]) -> String {
+    /// Build the dynamic system prompt with memories, preferences, and past mistakes
+    fn build_system_prompt(
+        &self,
+        memories: &[MemoryNode],
+        prefs: &[MemoryNode],
+        mistakes: &[MemoryNode],
+    ) -> String {
         let tool_counts = self.registry.count_by_type();
         let native_count = tool_counts.get(&ToolType::Native).unwrap_or(&0);
         let mcp_count = tool_counts.get(&ToolType::Mcp).unwrap_or(&0);
@@ -255,6 +251,20 @@ impl Agent {
                 .join("\n")
         };
 
+        // Format past mistakes as learning guidance
+        let mistakes_text = if mistakes.is_empty() {
+            String::new()
+        } else {
+            let mistake_items: Vec<String> = mistakes
+                .iter()
+                .map(|m| format!("- {}", m.content))
+                .collect();
+            format!(
+                "\n\nLEARNED FROM PAST MISTAKES:\n{}\n\nApply these lessons to avoid repeating errors.",
+                mistake_items.join("\n")
+            )
+        };
+
         format!(
             r#"You are Agent Brain, an autonomous AI assistant with persistent memory and extensible tools.
 
@@ -268,7 +278,7 @@ WHAT I KNOW:
 {}
 
 YOUR PREFERENCES:
-{}
+{}{}
 
 You can manage MCP servers (connect, disconnect, list, refresh) and skills.
 When you need a tool that doesn't exist, tell the user - they can add custom skills.
@@ -282,7 +292,8 @@ Be concise and helpful. Use tools when they can provide accurate information."#,
             skill_count,
             if skill_tools.is_empty() { "none" } else { &skill_tools },
             memories_text,
-            prefs_text
+            prefs_text,
+            mistakes_text
         )
     }
 
@@ -334,17 +345,19 @@ Be concise and helpful. Use tools when they can provide accurate information."#,
         info!("📚 [AGENT] Smart recall for: \"{}\"",
             if user_message.len() > 40 { &user_message[..40] } else { user_message });
 
-        // Get scored memories (top 5 facts + top 5 preferences)
+        // Get scored memories (top 5 facts + top 5 preferences + top 3 mistakes)
         let scored_memories = self.brain.smart_recall(user_message, 5).unwrap_or_default();
         let prefs = self.brain.smart_recall_prefs(user_message, 5).unwrap_or_default();
+        let mistakes = self.brain.recall_mistake_memories(user_message, 3).unwrap_or_default();
 
         // Extract just the memories for the system prompt
         let memories: Vec<_> = scored_memories.iter().map(|(m, _)| m.clone()).collect();
 
-        if memories.is_empty() && prefs.is_empty() {
+        if memories.is_empty() && prefs.is_empty() && mistakes.is_empty() {
             info!("📚 [AGENT] No relevant memories found for this query");
         } else {
-            info!("📚 [AGENT] Using {} memories and {} preferences", memories.len(), prefs.len());
+            info!("📚 [AGENT] Using {} memories, {} preferences, {} past mistakes",
+                memories.len(), prefs.len(), mistakes.len());
             for (mem, score) in &scored_memories {
                 info!("📚 [AGENT]   💭 score={:.3} [{}] \"{}\"", score, mem.memory_type,
                     if mem.content.len() > 40 { format!("{}...", &mem.content[..40]) } else { mem.content.clone() });
@@ -353,10 +366,14 @@ Be concise and helpful. Use tools when they can provide accurate information."#,
                 info!("📚 [AGENT]   ⭐ [pref] \"{}\"",
                     if pref.content.len() > 40 { format!("{}...", &pref.content[..40]) } else { pref.content.clone() });
             }
+            for mistake in &mistakes {
+                info!("📚 [AGENT]   🚨 [mistake] \"{}\"",
+                    if mistake.content.len() > 40 { format!("{}...", &mistake.content[..40]) } else { mistake.content.clone() });
+            }
         }
 
-        // Build dynamic system prompt with memories and session history
-        let mut system_prompt = self.build_system_prompt(&memories, &prefs);
+        // Build dynamic system prompt with memories, preferences, and past mistakes
+        let mut system_prompt = self.build_system_prompt(&memories, &prefs, &mistakes);
 
         // Add session context (previous messages in this session)
         let session_context = self.get_session_context();

@@ -1,7 +1,10 @@
+pub mod learning;
 pub mod planner;
 pub mod skill_factory;
+pub mod spec_extractor;
 pub mod task_queue;
 pub mod types;
+pub mod validator;
 pub mod workers;
 
 use std::collections::HashMap;
@@ -9,17 +12,22 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use learning::LearningModule;
 use planner::Planner;
 use skill_factory::SkillFactory;
+use spec_extractor::SpecExtractor;
 use task_queue::SharedTaskQueue;
 use types::{AgentType, TaskNode};
+use validator::Validator;
 use workers::{ToolExecutor, WorkerPool};
+
+use crate::graph::mistakes::MistakeExtractor;
 
 use crate::graph::GraphBrain;
 use crate::providers::LLMProvider;
 use crate::skills::SkillManager;
 use crate::tools::mcp_bridge::MCPBridge;
-use crate::tools::{BrowserTool, ToolRegistry};
+use crate::tools::ToolRegistry;
 use crate::types::{AgentError, ToolResult, ToolType};
 
 /// The Orchestrator coordinates multi-agent task execution
@@ -32,7 +40,10 @@ pub struct Orchestrator {
     brain: Arc<GraphBrain>,
     mcp_bridge: Option<Arc<Mutex<MCPBridge>>>,
     skill_manager: Option<Arc<Mutex<SkillManager>>>,
-    browser_tool: Option<Arc<BrowserTool>>,
+    // Self-improvement components
+    spec_extractor: SpecExtractor,
+    validator: Validator,
+    learning: LearningModule,
 }
 
 impl Orchestrator {
@@ -45,9 +56,14 @@ impl Orchestrator {
         let available_tools: Vec<String> = registry.definitions().iter().map(|t| t.name.clone()).collect();
 
         let planner = Planner::new(provider.clone(), available_tools);
-        let worker_pool = WorkerPool::new(provider, &registry);
+        let worker_pool = WorkerPool::new(provider.clone(), &registry);
         let task_queue = task_queue::create_shared_queue();
         let skill_factory = SkillFactory::new(skills_dir);
+
+        // Self-improvement components
+        let spec_extractor = SpecExtractor::new(provider.clone());
+        let validator = Validator::new(provider.clone());
+        let learning = LearningModule::new(brain.clone());
 
         Self {
             planner,
@@ -58,7 +74,9 @@ impl Orchestrator {
             brain,
             mcp_bridge: None,
             skill_manager: None,
-            browser_tool: None,
+            spec_extractor,
+            validator,
+            learning,
         }
     }
 
@@ -69,11 +87,6 @@ impl Orchestrator {
 
     pub fn with_skill_manager(mut self, manager: Arc<Mutex<SkillManager>>) -> Self {
         self.skill_manager = Some(manager);
-        self
-    }
-
-    pub fn with_browser(mut self, browser: Arc<BrowserTool>) -> Self {
-        self.browser_tool = Some(browser);
         self
     }
 
@@ -111,7 +124,6 @@ impl Orchestrator {
             registry: self.registry.clone(),
             mcp_bridge: self.mcp_bridge.clone(),
             skill_manager: self.skill_manager.clone(),
-            browser_tool: self.browser_tool.clone(),
         };
 
         loop {
@@ -208,7 +220,6 @@ impl Orchestrator {
             registry: self.registry.clone(),
             mcp_bridge: self.mcp_bridge.clone(),
             skill_manager: self.skill_manager.clone(),
-            browser_tool: self.browser_tool.clone(),
         };
 
         let worker = self.worker_pool.get_worker(&AgentType::Code)
@@ -276,6 +287,153 @@ impl Orchestrator {
     pub async fn stats(&self) -> task_queue::QueueStats {
         self.task_queue.lock().await.stats()
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SELF-IMPROVEMENT: Execute with validation and learning
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Execute a task with self-improvement loop
+    ///
+    /// Flow:
+    /// 1. Extract specification from task description
+    /// 2. Recall relevant past mistakes
+    /// 3. Execute task with mistake context
+    /// 4. Validate output against specification
+    /// 5. If validation fails: store mistakes, retry with corrections
+    /// 6. If validation passes: mark relevant mistakes as corrected
+    pub async fn execute_with_learning(
+        &self,
+        request: &str,
+        working_dir: Option<&str>,
+        max_retries: u32,
+    ) -> Result<LearningExecutionResult, AgentError> {
+        info!("🧠 [LEARNING] Starting execute_with_learning for: \"{}\"",
+            if request.len() > 50 { &request[..50] } else { request });
+
+        // Phase 1: Extract specification
+        let spec = match self.spec_extractor.extract(request).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("🧠 [LEARNING] Spec extraction failed, using quick extraction: {}", e);
+                self.spec_extractor.extract_quick(request)
+            }
+        };
+
+        info!("🧠 [LEARNING] Spec: {} numeric, {} outputs, {} qualitative requirements",
+            spec.numeric_requirements.len(),
+            spec.expected_outputs.len(),
+            spec.qualitative_requirements.len());
+
+        // Phase 2: Recall relevant mistakes
+        let mistake_context = self.learning.build_mistake_context(request, Some(&spec))
+            .unwrap_or_default();
+
+        if !mistake_context.is_empty() {
+            info!("🧠 [LEARNING] Injecting mistake context into execution");
+        }
+
+        // Phase 3: Execute with validation loop
+        let mut attempt = 0;
+        let mut last_validation: Option<types::ValidationResult> = None;
+        let mut mistakes_recorded: Vec<crate::types::MistakeNode> = Vec::new();
+
+        loop {
+            attempt += 1;
+            info!("🧠 [LEARNING] Attempt {}/{}", attempt, max_retries + 1);
+
+            // Build the request with any correction context
+            let effective_request = if attempt == 1 {
+                // First attempt: just add mistake context
+                if mistake_context.is_empty() {
+                    request.to_string()
+                } else {
+                    format!("{}\n\n{}", request, mistake_context)
+                }
+            } else {
+                // Retry: add correction prompt
+                if let Some(ref validation) = last_validation {
+                    self.learning.build_correction_prompt(request, validation, &spec, attempt)
+                } else {
+                    request.to_string()
+                }
+            };
+
+            // Execute the task
+            let result = self.execute(&effective_request).await?;
+
+            // Phase 4: Validate output
+            let validation = self.validator.validate(&spec, &result.response, working_dir).await?;
+
+            info!("🧠 [LEARNING] Validation result: {} (confidence: {:.2})",
+                if validation.overall_success { "PASS" } else { "FAIL" },
+                validation.confidence);
+
+            if validation.overall_success {
+                // Success! Mark any relevant mistakes as corrected
+                if !mistakes_recorded.is_empty() {
+                    let task_id = format!("learning-{}", uuid::Uuid::new_v4());
+                    self.learning.mark_corrected(&mistakes_recorded, &task_id)?;
+                }
+
+                return Ok(LearningExecutionResult {
+                    response: result.response,
+                    tasks_completed: result.tasks_completed,
+                    total_tokens: result.total_tokens,
+                    tools_used: result.tools_used,
+                    validation_passed: true,
+                    attempts: attempt,
+                    mistakes_recorded: mistakes_recorded.len(),
+                    mistakes_corrected: mistakes_recorded.len(),
+                });
+            }
+
+            // Validation failed
+            if attempt > max_retries {
+                // Max retries exceeded - store mistakes and return failure
+                let new_mistakes = MistakeExtractor::extract_mistakes(
+                    &validation,
+                    &spec,
+                    &format!("task-{}", uuid::Uuid::new_v4()),
+                );
+
+                for mistake in &new_mistakes {
+                    self.brain.record_mistake(mistake)?;
+                }
+
+                warn!("🧠 [LEARNING] Max retries exceeded. Recorded {} mistakes.", new_mistakes.len());
+
+                return Ok(LearningExecutionResult {
+                    response: result.response,
+                    tasks_completed: result.tasks_completed,
+                    total_tokens: result.total_tokens,
+                    tools_used: result.tools_used,
+                    validation_passed: false,
+                    attempts: attempt,
+                    mistakes_recorded: new_mistakes.len(),
+                    mistakes_corrected: 0,
+                });
+            }
+
+            // Phase 5: Store mistakes for this attempt
+            let new_mistakes = MistakeExtractor::extract_mistakes(
+                &validation,
+                &spec,
+                &format!("task-{}-attempt-{}", uuid::Uuid::new_v4(), attempt),
+            );
+
+            info!("🧠 [LEARNING] Extracted {} mistakes from failed attempt", new_mistakes.len());
+
+            // Record mistakes in database
+            for mistake in &new_mistakes {
+                self.brain.record_mistake(mistake)?;
+                mistakes_recorded.push(mistake.clone());
+            }
+
+            last_validation = Some(validation);
+
+            // Continue to next attempt
+        }
+    }
 }
 
 /// Tool executor for orchestrator workers
@@ -283,7 +441,6 @@ struct OrchestratorToolExecutor {
     registry: Arc<Mutex<ToolRegistry>>,
     mcp_bridge: Option<Arc<Mutex<MCPBridge>>>,
     skill_manager: Option<Arc<Mutex<SkillManager>>>,
-    browser_tool: Option<Arc<BrowserTool>>,
 }
 
 #[async_trait::async_trait]
@@ -338,4 +495,21 @@ pub struct OrchestratorResult {
     pub tasks_completed: usize,
     pub total_tokens: u32,
     pub tools_used: Vec<String>,
+}
+
+/// Result of execution with learning/validation loop
+#[derive(Debug)]
+pub struct LearningExecutionResult {
+    pub response: String,
+    pub tasks_completed: usize,
+    pub total_tokens: u32,
+    pub tools_used: Vec<String>,
+    /// Whether the final validation passed
+    pub validation_passed: bool,
+    /// Number of attempts made
+    pub attempts: u32,
+    /// Number of mistakes recorded during execution
+    pub mistakes_recorded: usize,
+    /// Number of past mistakes marked as corrected
+    pub mistakes_corrected: usize,
 }
