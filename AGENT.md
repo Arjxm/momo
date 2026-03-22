@@ -33,15 +33,19 @@ agent-brain/
 │   │   ├── arxiv.rs         # arXiv paper search
 │   │   ├── calculator.rs    # Math expression parser
 │   │   ├── web_fetch.rs     # HTTP fetching
-│   │   ├── browser.rs       # Headless Chrome automation (chromiumoxide)
 │   │   ├── mcp_client.rs    # MCP protocol client
 │   │   └── mcp_bridge.rs    # MCP server management
 │   ├── orchestrator/        # Multi-agent task orchestration
 │   │   ├── mod.rs           # Orchestrator main
-│   │   ├── types.rs         # Plan, TaskNode, AgentType
+│   │   ├── types.rs         # Plan, TaskNode, AgentType, TaskSpecification
 │   │   ├── task_queue.rs    # Task scheduling
 │   │   ├── workers.rs       # Worker pool
-│   │   └── skill_factory.rs # Dynamic skill generation
+│   │   ├── skill_factory.rs # Dynamic skill generation
+│   │   ├── spec_extractor.rs # LLM-based task specification extraction
+│   │   ├── validator.rs     # Output validation against specs
+│   │   └── learning.rs      # Mistake context and correction prompts
+│   ├── graph/
+│   │   └── mistakes.rs      # Mistake storage and recall
 │   └── skills/              # WASM-based user skills
 │       ├── mod.rs           # SkillManager
 │       ├── loader.rs        # Skill manifest loading
@@ -124,9 +128,8 @@ Native tools:
 - `calculator` - Math expressions
 - `arxiv_search` - Paper search
 - `web_fetch` - HTTP GET with HTML stripping
-- `browser` - Chrome automation (visible mode)
 
-MCP tools loaded from `mcp_servers.json`:
+MCP tools loaded from `mcp_servers.json` (includes Playwright for browser automation):
 ```json
 {
   "servers": [
@@ -140,19 +143,16 @@ MCP tools loaded from `mcp_servers.json`:
 }
 ```
 
-### 4. Browser Automation (`src/tools/browser.rs`)
+### 4. Browser Automation (Playwright MCP)
 
-Uses chromiumoxide with CDP. Currently runs in **visible mode** (not headless).
+Browser automation is handled via Playwright MCP server (`@playwright/mcp`).
 
-Actions:
-- `navigate` - Go to URL
-- `extract_text` - Get page text
-- `extract_links` - Get all links
-- `click` - Click element by selector
-- `fill` - Fill form field
-- `screenshot` - Capture page
-- `run_js` - Execute JavaScript
-- `get_html` - Get HTML content
+Actions available:
+- `browser_navigate` - Go to URL
+- `browser_click` - Click element by selector
+- `browser_fill` - Fill form field
+- `browser_snapshot` - Get page accessibility snapshot
+- `browser_screenshot` - Capture page
 
 ### 5. Debug Server (`src/debug_server.rs`)
 
@@ -185,12 +185,11 @@ RUST_LOG=info              # Logging level
 
 - `quit` / `exit` - Exit the agent
 - `debug` - Start debug visualization server
-- `cost` - Show token usage and cost
-- `clear` - Clear session conversation history
 - `stats` - Show graph statistics
-- `mode` - Toggle between simple/orchestration mode
-- `provider` - Show current provider info
-- Any other input - Send to agent
+- `mistakes` - Show all recorded mistakes from learning system
+- `/multi <task>` - Execute task with multi-agent orchestrator
+- `/learn <task>` - Execute task with validation and mistake recording
+- Any other input - Send to single agent
 
 ## Session vs Persistent Memory
 
@@ -204,6 +203,72 @@ RUST_LOG=info              # Logging level
 The agent remembers:
 - **Within session**: Full conversation (last 10 messages)
 - **Across sessions**: Extracted facts and preferences (scored by relevance)
+
+## Self-Improvement System (Learning)
+
+The learning system validates task outputs and records mistakes for future improvement.
+
+### Flow
+
+```
+User Task → Spec Extraction → Execution → Validation
+                                              ↓
+                              [PASS]     [FAIL]
+                                ↓          ↓
+                             Done    Store Mistakes
+                                          ↓
+                                    Retry with Correction
+                                          ↓
+                                    Mark as Corrected
+```
+
+### Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| SpecExtractor | `orchestrator/spec_extractor.rs` | LLM-based extraction of numeric requirements and expected outputs |
+| Validator | `orchestrator/validator.rs` | Compare actual output vs specification |
+| LearningModule | `orchestrator/learning.rs` | Build mistake context for prompts |
+| MistakeNode | `types.rs` + `graph/mistakes.rs` | Store/recall mistakes with similarity matching |
+
+### MistakeNode Structure
+
+```rust
+struct MistakeNode {
+    mistake_type: MistakeType,     // QuantityMismatch, MissingOutput, QualityIssue
+    severity: Severity,            // Critical, Major, Minor
+    description: String,           // "Only searched 2 sites instead of 3"
+    prevention_strategy: String,   // "Verify all sites before starting"
+    keywords: Vec<String>,         // For similarity matching
+    task_fingerprint: String,      // Hash for task type matching
+    was_corrected: bool,           // Corrected in retry?
+}
+```
+
+### Usage
+
+```
+# Execute with validation and mistake recording
+/learn search 3 e-commerce sites for headphones
+
+# View recorded mistakes
+mistakes
+```
+
+### Mistake Recall
+
+When executing similar tasks, past mistakes are recalled and injected into the system prompt:
+
+```
+## LEARNED FROM PAST MISTAKES:
+Apply these lessons to avoid repeating errors:
+
+🚨 1. [QuantityMismatch] Only searched 2 sites instead of 3
+   Prevention: Verify site count matches requirement before proceeding
+
+⚠️ 2. [MissingOutput] Expected CSV file was not created
+   Prevention: Always create required output files before completing task
+```
 
 ## Recent Fixes (Session History)
 
@@ -233,32 +298,50 @@ RUST_LOG=debug ./target/release/agent-brain
 RUST_LOG=info ./target/release/agent-brain
 ```
 
-## Memory Logging
+## Logging
 
-The system logs memory operations with emojis for easy identification:
+Logs are written to `/tmp/momo.log`. Tail in a separate terminal:
+```bash
+tail -f /tmp/momo.log
+```
 
+### Log Prefixes
+
+The system logs operations with prefixes for easy identification:
+
+**Memory System:**
 - `🧠 [MEMORY]` - Memory extraction operations (storing new memories)
 - `🔍 [RECALL]` - Memory recall operations (retrieving memories)
 - `📚 [AGENT]` - Agent using memories for context
 - `🧠 [BACKGROUND]` - Background memory extraction tasks
 
+**Learning System (Self-Improvement):**
+- `🧠 [LEARNING]` - Learning system operations (execute_with_learning)
+- `📚 [MISTAKE]` - Mistake storage and recall
+- `✅ [SPEC]` - Task specification extraction
+- `🔍 [VALIDATE]` - Output validation against specifications
+
 **Log examples:**
 ```
-🧠 [AGENT] Spawning background memory extraction task...
-🧠 [BACKGROUND] Memory extraction started for episode: abc123...
-🧠 [MEMORY] Starting memory extraction from interaction
-🧠 [MEMORY] Calling LLM to extract facts/preferences...
-🧠 [MEMORY] Extracted 2 memories from interaction:
-🧠 [MEMORY]   1. [fact] (importance: 0.80) "User is working on a Rust project"
-🧠 [MEMORY]   2. [preference] (importance: 0.70) "User prefers concise responses"
-🧠 [MEMORY] ✅ Stored memory: "User is working on a Rust project" (id: a1b2c3d4)
-🔍 [RECALL] Found 3 memories matching keywords:
-📚 [AGENT] Using 3 memories and 1 preferences for context
+🧠 [LEARNING] Starting execute_with_learning for: "search 3 sites..."
+✅ [SPEC] Extracted specification: 3 numeric requirements, 1 output
+🔍 [VALIDATE] Validating output against spec...
+🔍 [VALIDATE] Validation failed: 2 missing elements
+📚 [MISTAKE] Recording mistake: "Only searched 2 sites instead of 3"
+📚 [MISTAKE] Retrieved 3 relevant past mistakes for context
+🧠 [LEARNING] Retry 1/3 with correction prompt...
 ```
 
-**To see detailed memory flow:**
+**To set log level:**
 ```bash
-RUST_LOG=agent_brain::graph=debug,agent_brain::agent=info ./target/release/agent-brain
+# Default
+RUST_LOG=info,momo=debug cargo run
+
+# Verbose
+RUST_LOG=debug cargo run
+
+# Specific modules
+RUST_LOG=momo::orchestrator=trace,momo::graph=debug cargo run
 ```
 
 ## Configuration Files
@@ -275,11 +358,13 @@ Key crates:
 - `reqwest` - HTTP client
 - `serde` / `serde_json` / `toml` - Serialization
 - `quick-xml` - arXiv XML parsing
-- `chromiumoxide` - Browser automation
 - `wasmtime` - WASM sandbox for skills
 - `lbug` - Graph database
 - `warp` - Debug web server
 - `tracing` - Logging
+- `regex` - Pattern matching for spec extraction
+
+Browser automation is via Playwright MCP (`@playwright/mcp` npm package).
 
 ## Next Steps / TODO
 
@@ -345,8 +430,11 @@ Increase context length in LM Studio settings to 8192+
 ### MCP tools not loading
 Check `mcp_servers.json` exists and servers are enabled
 
-### Browser not launching
-Ensure Chrome/Chromium is installed, check for sandbox issues on Linux
+### Playwright MCP not working
+Ensure Playwright is installed: `npx playwright install`
 
 ### Debug page shows 0 memories in graph
 Fixed - was using `recall()` with empty keywords, now uses `get_all_memories()`
+
+### Learning system not recording mistakes
+Use `/learn <task>` prefix to enable validation. Check logs with `tail -f /tmp/momo.log`

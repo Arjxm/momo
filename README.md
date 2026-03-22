@@ -35,8 +35,6 @@ An autonomous AI agent built in Rust with **persistent graph-based memory**, mul
 
 ## Memory System
 
-MOMO's core differentiator is its persistent, graph-based memory that learns from every conversation.
-
 ### How Memory Works
 
 1. **Extraction**: After each interaction, an LLM extracts facts and preferences from the conversation
@@ -157,7 +155,7 @@ Configure in `mcp_servers.json`:
 - [x] Memory deduplication and contradiction detection
 - [x] MCP server integration
 - [x] Custom skills system (executable + knowledge)
-- [x] Browser automation with Chromium
+- [x] Browser automation via Playwright MCP
 - [x] Operation tracking and provenance
 - [x] Session conversation history
 
@@ -166,17 +164,34 @@ Configure in `mcp_servers.json`:
 - [ ] Task orchestrator with parallel workers
 - [ ] Autonomous task decomposition
 - [ ] Plan execution and monitoring
+- [ ] Self-improvement loop (validation, mistake storage, learning)
 
-### Roadmap: Self-Improving Agents
+### Self-Improvement System (Under Development)
 
-The next major milestone is enabling MOMO to improve itself:
+The self-improvement system enables MOMO to learn from mistakes:
+
+| Component | Status | Description |
+|-----------|--------|-------------|
+| Specification Extraction | Implemented | LLM extracts numeric requirements and expected outputs from tasks |
+| Output Validation | Implemented | Compares actual output against extracted specification |
+| Mistake Storage | Implemented | Records failures with prevention strategies in graph database |
+| Mistake Recall | Implemented | Retrieves relevant past mistakes for similar tasks |
+| Correction Prompts | Implemented | Generates retry prompts with mistake context |
+| Auto-Retry Loop | Implemented | Retries failed tasks with correction guidance |
+
+**Usage:** Prefix tasks with `/learn` to enable validation:
+```
+/learn search 3 e-commerce sites for headphones and save to CSV
+```
+
+**View mistakes:** Type `mistakes` to see recorded failures.
+
+### Roadmap
 
 1. **Tool Discovery**: Automatically discover and integrate new tools based on task requirements
 2. **Skill Learning**: Generate new skills from successful interaction patterns
-3. **Self-Reflection**: Analyze failed tasks and adjust strategies
-4. **Memory Consolidation**: Compress and merge related memories over time
-5. **Goal Autonomy**: Break down high-level goals into executable subtasks
-6. **Error Recovery**: Learn from failures and develop fallback strategies
+3. **Memory Consolidation**: Compress and merge related memories over time
+4. **Goal Autonomy**: Break down high-level goals into executable subtasks
 
 ## Project Structure
 
@@ -187,19 +202,22 @@ src/
 ├── graph/
 │   ├── mod.rs        # GraphBrain - unified graph interface
 │   ├── memory.rs     # Memory extraction and storage
+│   ├── mistakes.rs   # Mistake storage and recall
 │   └── schema.rs     # Graph schema definitions
 ├── tools/
 │   ├── mod.rs        # Tool registry
-│   ├── browser.rs    # Chromium automation
-│   └── mcp_bridge.rs # MCP protocol client
+│   └── mcp_bridge.rs # MCP protocol client (includes Playwright)
 ├── skills/
 │   ├── loader.rs     # Skill discovery and loading
 │   ├── registry.rs   # Skill management
 │   └── sandbox.rs    # WASM sandbox
-└── orchestrator/     # Task decomposition (WIP)
-    ├── planner.rs    # Task planning
-    ├── task_queue.rs # Priority queue
-    └── workers.rs    # Parallel execution
+└── orchestrator/
+    ├── planner.rs        # Task planning
+    ├── task_queue.rs     # Priority queue
+    ├── workers.rs        # Parallel execution
+    ├── spec_extractor.rs # Task specification extraction
+    ├── validator.rs      # Output validation
+    └── learning.rs       # Mistake context builder
 ```
 
 ## License
