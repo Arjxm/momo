@@ -25,7 +25,7 @@ use crate::providers::{create_provider, ProviderConfig, ProviderType};
 use crate::skills::SkillManager;
 use crate::tools::mcp_bridge::MCPBridge;
 use crate::tools::{
-    ArxivSearch, BrowserTool, Calculator, ExchangeRates, HackerNews, Tool, ToolRegistry, Weather,
+    ArxivSearch, Calculator, ExchangeRates, HackerNews, Tool, ToolRegistry, Weather,
     WebFetch, Wikipedia,
 };
 use crate::types::{AgentConfig, ToolNode, ToolType};
@@ -42,8 +42,25 @@ fn estimate_cost(input_tokens: u32, output_tokens: u32) -> f64 {
 
 #[tokio::main]
 async fn main() {
-    // Note: We don't initialize tracing to stdout since TUI captures the terminal.
-    // Logs are captured internally by the TUI app state.
+    // Initialize file-based tracing for debug logs
+    // Tail logs in another terminal: tail -f /tmp/momo.log
+    let log_file = std::fs::File::create("/tmp/momo.log").ok();
+    if let Some(file) = log_file {
+        use tracing_subscriber::{fmt, EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+        let file_layer = fmt::layer()
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .with_target(true)
+            .with_level(true);
+
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info,momo=debug"));
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .init();
+    }
 
     // Load environment variables from .env file
     if let Err(e) = dotenvy::dotenv() {
@@ -138,11 +155,6 @@ async fn main() {
         startup_logs.push(format!("Connected to {} MCP servers", bridge.connected_servers().len()));
     }
 
-    // Register browser tool
-    let browser = Arc::new(BrowserTool::new());
-    registry.register_with_type(browser.as_ref().clone(), ToolType::Browser);
-    startup_logs.push("Browser tool registered".to_string());
-
     // Create provider configuration
     let provider_config = ProviderConfig {
         provider_type: match app_config.provider.provider_type.as_str() {
@@ -221,8 +233,7 @@ async fn main() {
     )
     .with_memory_extractor()
     .with_skill_manager(skill_manager.clone())
-    .with_mcp_bridge(mcp_bridge.clone())
-    .with_browser(browser.clone());
+    .with_mcp_bridge(mcp_bridge.clone());
 
     // Create the orchestrator for complex multi-task operations
     let orchestrator = Orchestrator::new(
@@ -232,8 +243,7 @@ async fn main() {
         app_config.skills_dir.clone().into(),
     )
     .with_mcp_bridge(mcp_bridge)
-    .with_skill_manager(skill_manager)
-    .with_browser(browser.clone());
+    .with_skill_manager(skill_manager);
 
     // Wrap agent and orchestrator in Arc for sharing across tasks
     let agent = Arc::new(agent);
@@ -284,7 +294,17 @@ async fn main() {
         if let Some(input) = pending {
             // Clone what we need for the async task
             let agent_clone = agent.clone();
+            let orchestrator_clone = orchestrator.clone();
             let app_clone = app.clone();
+
+            // Check for mode prefixes
+            let (use_orchestrator, use_learning, task) = if input.starts_with("/multi ") {
+                (true, false, input.strip_prefix("/multi ").unwrap().to_string())
+            } else if input.starts_with("/learn ") {
+                (true, true, input.strip_prefix("/learn ").unwrap().to_string())
+            } else {
+                (false, false, input.clone())
+            };
 
             // Process special commands
             match input.to_lowercase().as_str() {
@@ -310,42 +330,158 @@ async fn main() {
                     app_guard.is_thinking = false;
                     app_guard.status = "Debug server running".to_string();
                 }
-                _ => {
-                    // Run the agent in a background task
-                    tokio::spawn(async move {
-                        {
-                            let mut app_guard = app_clone.lock().unwrap();
-                            app_guard.add_log("INFO", &format!("Processing: {}", input));
-                        }
-
-                        match agent_clone.run(&input).await {
-                            Ok(result) => {
-                                let mut app_guard = app_clone.lock().unwrap();
+                "mistakes" => {
+                    let mut app_guard = app_clone.lock().unwrap();
+                    match brain.get_all_mistakes() {
+                        Ok(mistakes) => {
+                            if mistakes.is_empty() {
                                 app_guard.add_assistant_message(
-                                    &result.response,
-                                    (result.usage.input_tokens, result.usage.output_tokens),
-                                    result.tools_used,
-                                );
-                                app_guard.is_thinking = false;
-                                app_guard.status = "Ready".to_string();
-                                app_guard.add_log(
-                                    "INFO",
-                                    &format!(
-                                        "Response complete: {} in, {} out tokens",
-                                        result.usage.input_tokens, result.usage.output_tokens
-                                    ),
-                                );
-                            }
-                            Err(e) => {
-                                let mut app_guard = app_clone.lock().unwrap();
-                                app_guard.add_assistant_message(
-                                    &format!("Error: {}", e),
+                                    "No mistakes recorded yet. Use `/learn <task>` to execute with validation.",
                                     (0, 0),
                                     vec![],
                                 );
-                                app_guard.is_thinking = false;
-                                app_guard.status = "Error occurred".to_string();
-                                app_guard.add_log("ERROR", &format!("Agent error: {}", e));
+                            } else {
+                                let mut output = format!("📚 {} Recorded Mistakes:\n\n", mistakes.len());
+                                for (i, m) in mistakes.iter().enumerate() {
+                                    let icon = match m.severity {
+                                        crate::types::Severity::Critical => "🚨",
+                                        crate::types::Severity::Major => "⚠️",
+                                        crate::types::Severity::Minor => "💡",
+                                    };
+                                    output.push_str(&format!(
+                                        "{} {}. [{}] {}\n   Type: {:?}\n   Prevention: {}\n   Corrected: {}\n\n",
+                                        icon, i + 1, m.severity, m.description,
+                                        m.mistake_type, m.prevention_strategy,
+                                        if m.was_corrected { "Yes" } else { "No" }
+                                    ));
+                                }
+                                app_guard.add_assistant_message(&output, (0, 0), vec![]);
+                            }
+                        }
+                        Err(e) => {
+                            app_guard.add_assistant_message(&format!("Error fetching mistakes: {}", e), (0, 0), vec![]);
+                        }
+                    }
+                    app_guard.is_thinking = false;
+                    app_guard.status = "Ready".to_string();
+                }
+                _ => {
+                    // Run agent or orchestrator in a background task
+                    tokio::spawn(async move {
+                        {
+                            let mut app_guard = app_clone.lock().unwrap();
+                            let mode = if use_orchestrator { "multi-agent" } else { "single-agent" };
+                            app_guard.add_log("INFO", &format!("[{}] Processing: {}", mode, task));
+                        }
+
+                        if use_learning {
+                            // Learning mode: execute with validation and mistake recording
+                            {
+                                let mut app_guard = app_clone.lock().unwrap();
+                                app_guard.add_log("INFO", "🧠 [LEARNING] Executing with validation...");
+                            }
+                            match orchestrator_clone.execute_with_learning(&task, None, 3).await {
+                                Ok(result) => {
+                                    let mut app_guard = app_clone.lock().unwrap();
+                                    let status = if result.validation_passed {
+                                        "✅ Validation passed"
+                                    } else {
+                                        "❌ Validation failed - mistakes recorded"
+                                    };
+                                    let output = format!(
+                                        "{}\n\n---\n{}\nMistakes recorded: {}\nRetries: {}",
+                                        result.response, status, result.mistakes_recorded, result.attempts
+                                    );
+                                    app_guard.add_assistant_message(
+                                        &output,
+                                        (result.total_tokens, 0),
+                                        result.tools_used,
+                                    );
+                                    app_guard.is_thinking = false;
+                                    app_guard.status = format!("Ready | {}", status);
+                                    app_guard.add_log(
+                                        "INFO",
+                                        &format!(
+                                            "Learning complete: {} mistakes, {} retries",
+                                            result.mistakes_recorded, result.attempts
+                                        ),
+                                    );
+                                }
+                                Err(e) => {
+                                    let mut app_guard = app_clone.lock().unwrap();
+                                    app_guard.add_assistant_message(
+                                        &format!("Learning error: {}", e),
+                                        (0, 0),
+                                        vec![],
+                                    );
+                                    app_guard.is_thinking = false;
+                                    app_guard.status = "Error occurred".to_string();
+                                    app_guard.add_log("ERROR", &format!("Learning error: {}", e));
+                                }
+                            }
+                        } else if use_orchestrator {
+                            // Multi-agent mode via orchestrator
+                            match orchestrator_clone.execute(&task).await {
+                                Ok(result) => {
+                                    let mut app_guard = app_clone.lock().unwrap();
+                                    app_guard.add_assistant_message(
+                                        &result.response,
+                                        (result.total_tokens, 0),
+                                        result.tools_used,
+                                    );
+                                    app_guard.is_thinking = false;
+                                    app_guard.status = format!("Ready | {} tasks completed", result.tasks_completed);
+                                    app_guard.add_log(
+                                        "INFO",
+                                        &format!(
+                                            "Orchestrator complete: {} tasks, {} tokens",
+                                            result.tasks_completed, result.total_tokens
+                                        ),
+                                    );
+                                }
+                                Err(e) => {
+                                    let mut app_guard = app_clone.lock().unwrap();
+                                    app_guard.add_assistant_message(
+                                        &format!("Orchestrator error: {}", e),
+                                        (0, 0),
+                                        vec![],
+                                    );
+                                    app_guard.is_thinking = false;
+                                    app_guard.status = "Error occurred".to_string();
+                                    app_guard.add_log("ERROR", &format!("Orchestrator error: {}", e));
+                                }
+                            }
+                        } else {
+                            // Single-agent mode
+                            match agent_clone.run(&task).await {
+                                Ok(result) => {
+                                    let mut app_guard = app_clone.lock().unwrap();
+                                    app_guard.add_assistant_message(
+                                        &result.response,
+                                        (result.usage.input_tokens, result.usage.output_tokens),
+                                        result.tools_used,
+                                    );
+                                    app_guard.is_thinking = false;
+                                    app_guard.status = "Ready".to_string();
+                                    app_guard.add_log(
+                                        "INFO",
+                                        &format!(
+                                            "Response complete: {} in, {} out tokens",
+                                            result.usage.input_tokens, result.usage.output_tokens
+                                        ),
+                                    );
+                                }
+                                Err(e) => {
+                                    let mut app_guard = app_clone.lock().unwrap();
+                                    app_guard.add_assistant_message(
+                                        &format!("Error: {}", e),
+                                        (0, 0),
+                                        vec![],
+                                    );
+                                    app_guard.is_thinking = false;
+                                    app_guard.status = "Error occurred".to_string();
+                                    app_guard.add_log("ERROR", &format!("Agent error: {}", e));
+                                }
                             }
                         }
                     });
@@ -366,7 +502,6 @@ async fn main() {
 
     // Cleanup
     tui.restore().ok();
-    browser.cleanup().await;
 
     // Print session summary
     let app_guard = app.lock().unwrap();
@@ -504,13 +639,6 @@ fn register_native_tools(registry: &mut ToolRegistry, brain: &Arc<GraphBrain>) -
 // ═══════════════════════════════════════════════════════════════════
 // TOOL WRAPPERS
 // ═══════════════════════════════════════════════════════════════════
-
-/// Wrapper to make BrowserTool clonable for registration
-impl Clone for BrowserTool {
-    fn clone(&self) -> Self {
-        BrowserTool::new()
-    }
-}
 
 /// Wrapper for skill tools (execute via skill manager)
 struct SkillToolWrapper {
