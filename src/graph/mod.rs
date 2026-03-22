@@ -1,4 +1,5 @@
 pub mod memory;
+pub mod mistakes;
 pub mod queries;
 pub mod schema;
 
@@ -1304,6 +1305,7 @@ fn parse_memory_type(s: &str) -> MemoryType {
     match s.to_lowercase().as_str() {
         "preference" => MemoryType::Preference,
         "episode_summary" => MemoryType::EpisodeSummary,
+        "mistake" => MemoryType::Mistake,
         _ => MemoryType::Fact,
     }
 }
