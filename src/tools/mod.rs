@@ -1,5 +1,4 @@
 pub mod arxiv;
-pub mod browser;
 pub mod calculator;
 pub mod free_apis;
 pub mod mcp_bridge;
@@ -87,7 +86,6 @@ fn simplify_schema(schema: serde_json::Value, depth: usize) -> serde_json::Value
 }
 
 pub use arxiv::ArxivSearch;
-pub use browser::BrowserTool;
 pub use calculator::Calculator;
 pub use free_apis::{ExchangeRates, HackerNews, Weather, Wikipedia};
 pub use mcp_bridge::MCPBridge;

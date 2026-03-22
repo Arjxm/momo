@@ -36,8 +36,7 @@ thiserror = "1"
 # MCP client (JSON-RPC based)
 # rmcp = "0.1"  # We'll implement MCP manually for more control
 
-# Browser automation
-chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
+# Async utilities
 futures = "0.3"
 
 # WASM sandbox for user skills
@@ -51,6 +50,7 @@ urlencoding = "2.1"
 notify = "7"
 lbug = "0.15.2"
 sha2 = "0.10"
+regex = "1"
 
 # Debug web server
 warp = "0.3"

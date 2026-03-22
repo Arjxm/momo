@@ -1,6 +1,15 @@
 {
   "servers": [
     {
+      "name": "playwright",
+      "description": "Browser automation with Playwright. Navigate, click, fill forms, extract content, take screenshots.",
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"],
+      "transport": "stdio",
+      "env": {},
+      "auto_connect": true
+    },
+    {
       "name": "memory",
       "description": "Persistent entity-relationship memory. Create entities, relations, observations.",
       "command": "npx",
@@ -23,15 +32,6 @@
       "description": "Read, write, search files. Access restricted to home directory.",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/arjun"],
-      "transport": "stdio",
-      "env": {},
-      "auto_connect": true
-    },
-    {
-      "name": "duckduckgo",
-      "description": "Privacy-focused web search. No API key needed.",
-      "command": "npx",
-      "args": ["-y", "duckduckgo-mcp-server"],
       "transport": "stdio",
       "env": {},
       "auto_connect": true
