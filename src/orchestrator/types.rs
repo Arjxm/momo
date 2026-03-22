@@ -382,3 +382,225 @@ impl SkillTemplate {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// SELF-IMPROVEMENT: Task Specification & Validation
+// ═══════════════════════════════════════════════════════════════════
+
+/// A numeric requirement extracted from a task description
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NumericRequirement {
+    /// What is being counted (e.g., "sites", "products")
+    pub entity: String,
+    /// The expected count
+    pub expected_count: u32,
+    /// Operator for comparison (exactly, at_least, at_most)
+    pub comparison: ComparisonOp,
+}
+
+/// Comparison operator for numeric requirements
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonOp {
+    Exactly,
+    AtLeast,
+    AtMost,
+}
+
+impl Default for ComparisonOp {
+    fn default() -> Self {
+        ComparisonOp::AtLeast
+    }
+}
+
+/// An expected output from task execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectedOutput {
+    /// Name or pattern of the expected output
+    pub name: String,
+    /// Type of output (file, data, message)
+    pub output_type: OutputType,
+    /// Whether this output is required or optional
+    pub required: bool,
+}
+
+/// Type of expected output
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputType {
+    File,
+    Data,
+    Message,
+    Artifact,
+}
+
+impl Default for OutputType {
+    fn default() -> Self {
+        OutputType::Data
+    }
+}
+
+/// Specification extracted from a task description
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSpecification {
+    /// Numeric requirements (e.g., "3 sites", "10 products each")
+    pub numeric_requirements: Vec<NumericRequirement>,
+    /// Expected outputs to be produced
+    pub expected_outputs: Vec<ExpectedOutput>,
+    /// Qualitative requirements (free-form text)
+    pub qualitative_requirements: Vec<String>,
+    /// Keywords for similarity matching
+    pub keywords: Vec<String>,
+    /// Original task description
+    pub original_description: String,
+}
+
+impl TaskSpecification {
+    pub fn new(description: String) -> Self {
+        Self {
+            numeric_requirements: Vec::new(),
+            expected_outputs: Vec::new(),
+            qualitative_requirements: Vec::new(),
+            keywords: Vec::new(),
+            original_description: description,
+        }
+    }
+
+    /// Generate a fingerprint for task matching
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+
+        // Hash based on keywords and requirement types
+        let mut parts: Vec<String> = self.keywords.clone();
+        for req in &self.numeric_requirements {
+            parts.push(format!("num:{}", req.entity));
+        }
+        for out in &self.expected_outputs {
+            parts.push(format!("out:{}", out.name));
+        }
+        parts.sort();
+        hasher.update(parts.join(",").as_bytes());
+
+        format!("{:x}", hasher.finalize())[..16].to_string()
+    }
+
+    /// Check if this spec has any requirements to validate
+    pub fn has_requirements(&self) -> bool {
+        !self.numeric_requirements.is_empty()
+            || !self.expected_outputs.is_empty()
+            || !self.qualitative_requirements.is_empty()
+    }
+}
+
+/// Result of validating a single requirement
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequirementResult {
+    /// The requirement description
+    pub requirement: String,
+    /// Whether it passed
+    pub passed: bool,
+    /// Actual value observed (if applicable)
+    pub actual_value: Option<String>,
+    /// Expected value (if applicable)
+    pub expected_value: Option<String>,
+    /// Explanation of the result
+    pub explanation: String,
+}
+
+/// Result of validating a single output
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputResult {
+    /// The expected output
+    pub expected: ExpectedOutput,
+    /// Whether it was found
+    pub found: bool,
+    /// Location or details of found output
+    pub location: Option<String>,
+}
+
+/// Element that was missing or incorrect
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissingElement {
+    /// What's missing
+    pub element: String,
+    /// Category (numeric, output, qualitative)
+    pub category: String,
+    /// Detailed explanation
+    pub details: String,
+}
+
+/// Overall result of validating task output against specification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationResult {
+    /// Whether all requirements were met
+    pub overall_success: bool,
+    /// Results for each numeric/qualitative requirement
+    pub requirement_results: Vec<RequirementResult>,
+    /// Results for each expected output
+    pub output_results: Vec<OutputResult>,
+    /// Summary of what's missing
+    pub missing_elements: Vec<MissingElement>,
+    /// Overall confidence score (0.0 - 1.0)
+    pub confidence: f64,
+    /// Human-readable summary
+    pub summary: String,
+}
+
+impl ValidationResult {
+    /// Create a successful validation result
+    pub fn success() -> Self {
+        Self {
+            overall_success: true,
+            requirement_results: Vec::new(),
+            output_results: Vec::new(),
+            missing_elements: Vec::new(),
+            confidence: 1.0,
+            summary: "All requirements satisfied".to_string(),
+        }
+    }
+
+    /// Create a failed validation result
+    pub fn failure(summary: String) -> Self {
+        Self {
+            overall_success: false,
+            requirement_results: Vec::new(),
+            output_results: Vec::new(),
+            missing_elements: Vec::new(),
+            confidence: 0.0,
+            summary,
+        }
+    }
+
+    /// Add a requirement result
+    pub fn with_requirement(mut self, result: RequirementResult) -> Self {
+        if !result.passed {
+            self.overall_success = false;
+        }
+        self.requirement_results.push(result);
+        self
+    }
+
+    /// Add an output result
+    pub fn with_output(mut self, result: OutputResult) -> Self {
+        if !result.found && result.expected.required {
+            self.overall_success = false;
+        }
+        self.output_results.push(result);
+        self
+    }
+
+    /// Add a missing element
+    pub fn with_missing(mut self, element: MissingElement) -> Self {
+        self.overall_success = false;
+        self.missing_elements.push(element);
+        self
+    }
+
+    /// Count the number of failures
+    pub fn failure_count(&self) -> usize {
+        let req_failures = self.requirement_results.iter().filter(|r| !r.passed).count();
+        let output_failures = self.output_results.iter().filter(|r| !r.found && r.expected.required).count();
+        req_failures + output_failures + self.missing_elements.len()
+    }
+}

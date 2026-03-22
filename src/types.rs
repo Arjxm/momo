@@ -464,6 +464,7 @@ pub enum MemoryType {
     Fact,
     Preference,
     EpisodeSummary,
+    Mistake,
 }
 
 impl std::fmt::Display for MemoryType {
@@ -472,6 +473,7 @@ impl std::fmt::Display for MemoryType {
             MemoryType::Fact => write!(f, "fact"),
             MemoryType::Preference => write!(f, "preference"),
             MemoryType::EpisodeSummary => write!(f, "episode_summary"),
+            MemoryType::Mistake => write!(f, "mistake"),
         }
     }
 }
@@ -720,5 +722,225 @@ impl std::fmt::Display for GraphStats {
             self.episodes,
             self.topics
         )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MISTAKE TRACKING (Self-Improvement)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Type of mistake made during task execution
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MistakeType {
+    /// Expected N items but got M (e.g., "3 sites" but only found 2)
+    QuantityMismatch,
+    /// Expected output file/artifact missing
+    MissingOutput,
+    /// Output doesn't match quality requirements
+    QualityIssue,
+    /// Task not completed within constraints
+    IncompleteTask,
+    /// Tool execution error not handled properly
+    ToolFailure,
+    /// Wrong approach or methodology used
+    MethodologyError,
+    /// Other mistake types
+    Other,
+}
+
+impl std::fmt::Display for MistakeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MistakeType::QuantityMismatch => write!(f, "quantity_mismatch"),
+            MistakeType::MissingOutput => write!(f, "missing_output"),
+            MistakeType::QualityIssue => write!(f, "quality_issue"),
+            MistakeType::IncompleteTask => write!(f, "incomplete_task"),
+            MistakeType::ToolFailure => write!(f, "tool_failure"),
+            MistakeType::MethodologyError => write!(f, "methodology_error"),
+            MistakeType::Other => write!(f, "other"),
+        }
+    }
+}
+
+impl std::str::FromStr for MistakeType {
+    type Err = AgentError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "quantity_mismatch" => Ok(MistakeType::QuantityMismatch),
+            "missing_output" => Ok(MistakeType::MissingOutput),
+            "quality_issue" => Ok(MistakeType::QualityIssue),
+            "incomplete_task" => Ok(MistakeType::IncompleteTask),
+            "tool_failure" => Ok(MistakeType::ToolFailure),
+            "methodology_error" => Ok(MistakeType::MethodologyError),
+            "other" => Ok(MistakeType::Other),
+            _ => Ok(MistakeType::Other),
+        }
+    }
+}
+
+/// Severity level of a mistake
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// Minor issue, task still usable
+    Minor = 0,
+    /// Significant issue, partial success
+    Major = 1,
+    /// Complete failure, task unusable
+    Critical = 2,
+}
+
+impl Default for Severity {
+    fn default() -> Self {
+        Severity::Major
+    }
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Severity::Minor => write!(f, "minor"),
+            Severity::Major => write!(f, "major"),
+            Severity::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+impl std::str::FromStr for Severity {
+    type Err = AgentError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "minor" => Ok(Severity::Minor),
+            "major" => Ok(Severity::Major),
+            "critical" => Ok(Severity::Critical),
+            _ => Ok(Severity::Major),
+        }
+    }
+}
+
+/// A mistake node representing a learned failure pattern
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MistakeNode {
+    pub id: String,
+    /// The type of mistake
+    pub mistake_type: MistakeType,
+    /// Human-readable description of what went wrong
+    pub description: String,
+    /// Severity level
+    pub severity: Severity,
+    /// Detailed deviation info (e.g., "Expected: 3, Actual: 2")
+    pub deviation_details: String,
+    /// How to prevent this mistake in the future
+    pub prevention_strategy: String,
+    /// Keywords for similarity matching
+    pub keywords: Vec<String>,
+    /// Hash of the task type for fingerprint matching
+    pub task_fingerprint: String,
+    /// Whether this mistake was corrected in a retry
+    pub was_corrected: bool,
+    /// The task ID that caused this mistake
+    pub source_task_id: String,
+    /// The task ID that corrected this mistake (if any)
+    pub corrected_by_task_id: Option<String>,
+    /// When the mistake was recorded
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl MistakeNode {
+    pub fn new(
+        mistake_type: MistakeType,
+        description: String,
+        severity: Severity,
+        deviation_details: String,
+        prevention_strategy: String,
+        source_task_id: String,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            mistake_type,
+            description,
+            severity,
+            deviation_details,
+            prevention_strategy,
+            keywords: Vec::new(),
+            task_fingerprint: String::new(),
+            was_corrected: false,
+            source_task_id,
+            corrected_by_task_id: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Add keywords for similarity matching
+    pub fn with_keywords(mut self, keywords: Vec<String>) -> Self {
+        self.keywords = keywords;
+        self
+    }
+
+    /// Set the task fingerprint
+    pub fn with_fingerprint(mut self, fingerprint: String) -> Self {
+        self.task_fingerprint = fingerprint;
+        self
+    }
+
+    /// Mark this mistake as corrected
+    pub fn mark_corrected(&mut self, correcting_task_id: String) {
+        self.was_corrected = true;
+        self.corrected_by_task_id = Some(correcting_task_id);
+    }
+
+    /// Convert to a memory node for storage
+    pub fn to_memory_node(&self) -> MemoryNode {
+        let content = format!(
+            "[MISTAKE] {}: {} | Prevention: {}",
+            self.mistake_type, self.description, self.prevention_strategy
+        );
+        let mut memory = MemoryNode::new(content, MemoryType::Mistake, 0.8);
+        memory.source_task_id = Some(self.source_task_id.clone());
+        memory
+    }
+
+    /// Calculate a relevance score for a given query
+    pub fn relevance_score(&self, query_keywords: &[String], query_fingerprint: &str) -> f64 {
+        let mut score = 0.0;
+
+        // Fingerprint exact match: high weight
+        if !self.task_fingerprint.is_empty() && self.task_fingerprint == query_fingerprint {
+            score += 0.5;
+        }
+
+        // Keyword matching
+        if !self.keywords.is_empty() && !query_keywords.is_empty() {
+            let keyword_matches: usize = self
+                .keywords
+                .iter()
+                .filter(|k| query_keywords.iter().any(|qk| qk.contains(k.as_str()) || k.contains(qk.as_str())))
+                .count();
+            let keyword_score = keyword_matches as f64 / self.keywords.len().max(1) as f64;
+            score += keyword_score * 0.3;
+        }
+
+        // Severity weight: critical mistakes are more important to remember
+        let severity_weight = match self.severity {
+            Severity::Critical => 0.2,
+            Severity::Major => 0.15,
+            Severity::Minor => 0.1,
+        };
+        score += severity_weight;
+
+        // Recency bonus (mistakes from recent tasks more relevant)
+        let hours_old = (chrono::Utc::now() - self.created_at).num_hours() as f64;
+        let recency_score = (-0.01 * hours_old).exp(); // Decay over ~100 hours
+        score += recency_score * 0.1;
+
+        // Penalty if already corrected (less urgent)
+        if self.was_corrected {
+            score *= 0.7;
+        }
+
+        score.min(1.0)
     }
 }

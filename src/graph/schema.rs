@@ -15,7 +15,7 @@ use crate::types::AgentError;
 /// Schema creation is handled directly in GraphBrain for now
 /// This module provides schema constants and utilities
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Initialize the database schema using raw query execution
 pub fn create_schema_queries() -> Vec<&'static str> {
@@ -151,6 +151,55 @@ pub fn create_schema_queries() -> Vec<&'static str> {
         )"#,
 
         // ═══════════════════════════════════════════════════════════════════
+        // SELF-IMPROVEMENT TABLES (Task Specification, Validation, Mistakes)
+        // ═══════════════════════════════════════════════════════════════════
+
+        // TaskSpec - Stores extracted specifications for validation
+        r#"CREATE NODE TABLE IF NOT EXISTS TaskSpec(
+            id STRING,
+            task_id STRING,
+            numeric_requirements STRING,
+            expected_outputs STRING,
+            qualitative_requirements STRING,
+            keywords STRING,
+            fingerprint STRING,
+            created_at STRING,
+            PRIMARY KEY(id)
+        )"#,
+
+        // Validation - Stores validation results
+        r#"CREATE NODE TABLE IF NOT EXISTS Validation(
+            id STRING,
+            task_id STRING,
+            spec_id STRING,
+            overall_success BOOLEAN,
+            requirement_results STRING,
+            output_results STRING,
+            missing_elements STRING,
+            confidence DOUBLE,
+            summary STRING,
+            created_at STRING,
+            PRIMARY KEY(id)
+        )"#,
+
+        // Mistake - Stores detailed mistake information
+        r#"CREATE NODE TABLE IF NOT EXISTS Mistake(
+            id STRING,
+            mistake_type STRING,
+            description STRING,
+            severity STRING,
+            deviation_details STRING,
+            prevention_strategy STRING,
+            keywords STRING,
+            task_fingerprint STRING,
+            was_corrected BOOLEAN DEFAULT false,
+            source_task_id STRING,
+            corrected_by_task_id STRING,
+            created_at STRING,
+            PRIMARY KEY(id)
+        )"#,
+
+        // ═══════════════════════════════════════════════════════════════════
         // RELATIONSHIP TABLES - User Relations
         // ═══════════════════════════════════════════════════════════════════
         "CREATE REL TABLE IF NOT EXISTS INTERESTED_IN(FROM User TO Topic)",
@@ -205,5 +254,14 @@ pub fn create_schema_queries() -> Vec<&'static str> {
         // ═══════════════════════════════════════════════════════════════════
         "CREATE REL TABLE IF NOT EXISTS HAS_TASK(FROM Plan TO Task)",
         "CREATE REL TABLE IF NOT EXISTS INITIATED_BY(FROM Plan TO User)",
+
+        // ═══════════════════════════════════════════════════════════════════
+        // RELATIONSHIP TABLES - Self-Improvement (Validation & Mistakes)
+        // ═══════════════════════════════════════════════════════════════════
+        "CREATE REL TABLE IF NOT EXISTS HAS_SPEC(FROM Task TO TaskSpec)",
+        "CREATE REL TABLE IF NOT EXISTS VALIDATED_BY(FROM Task TO Validation)",
+        "CREATE REL TABLE IF NOT EXISTS FOUND_MISTAKE(FROM Validation TO Mistake)",
+        "CREATE REL TABLE IF NOT EXISTS CAUSED(FROM Task TO Mistake)",
+        "CREATE REL TABLE IF NOT EXISTS CORRECTED_BY(FROM Mistake TO Task)",
     ]
 }
